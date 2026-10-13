@@ -1,0 +1,39 @@
+2026-10-09T17:32:07.698Z ---- arranque ----
+2026-10-09T17:32:07.703Z Usando PostgreSQL externo: postgres://gastos:***@localhost:5432/gastos_ti
+2026-10-09T17:32:07.818Z No se pudo preparar la base de datos: la autentificaci�n password fall� para el usuario �gastos�
+2026-10-09T17:41:59.434Z ---- arranque ----
+2026-10-09T17:41:59.508Z Creando la base de datos PostgreSQL embebida en C:\Users\Martinez\Desktop\TI gastos\pgdata ...
+2026-10-09T17:42:22.336Z PostgreSQL embebido listo en 127.0.0.1:5433 (datos en C:\Users\Martinez\Desktop\TI gastos\pgdata)
+2026-10-09T17:42:22.681Z Gastos TI escuchando en http://localhost:3000 (PDFs en C:\Users\Martinez\Desktop\TI gastos\uploads)
+2026-10-09T18:50:16.138Z ---- arranque ----
+2026-10-09T18:50:21.946Z PostgreSQL embebido listo en 127.0.0.1:5433 (datos en C:\Users\Martinez\Desktop\TI gastos\pgdata)
+2026-10-09T18:50:22.199Z Gastos TI escuchando en http://localhost:3000 (PDFs en C:\Users\Martinez\Desktop\TI gastos\uploads)
+2026-10-09T19:06:26.431Z ---- arranque ----
+2026-10-09T19:06:28.116Z PostgreSQL embebido listo en 127.0.0.1:5433 (datos en C:\Users\Martinez\Desktop\TI gastos\pgdata)
+2026-10-09T19:06:28.300Z Gastos TI escuchando en http://localhost:3000 (PDFs en C:\Users\Martinez\Desktop\TI gastos\uploads)
+2026-10-09T19:31:25.734Z ---- arranque ----
+2026-10-09T19:31:25.850Z Se limpió un postmaster.pid huérfano.
+2026-10-09T19:31:27.525Z PostgreSQL embebido listo en 127.0.0.1:5433 (datos en C:\Users\Martinez\Desktop\TI gastos\pgdata)
+2026-10-09T19:31:27.715Z Gastos TI escuchando en http://localhost:3000 (PDFs en C:\Users\Martinez\Desktop\TI gastos\uploads)
+2026-10-09T19:44:44.985Z ---- arranque ----
+2026-10-09T19:44:45.024Z Se limpió un postmaster.pid huérfano.
+2026-10-09T19:44:46.641Z PostgreSQL embebido listo en 127.0.0.1:5433 (datos en C:\Users\Martinez\Desktop\TI gastos\pgdata)
+2026-10-09T19:44:46.850Z Gastos TI escuchando en http://localhost:3000 (PDFs en C:\Users\Martinez\Desktop\TI gastos\uploads)
+2026-10-09T20:06:34.139Z ---- arranque ----
+2026-10-09T20:06:34.179Z Se limpió un postmaster.pid huérfano.
+2026-10-09T20:06:35.969Z PostgreSQL embebido listo en 127.0.0.1:5433 (datos en C:\Users\Martinez\Desktop\TI gastos\pgdata)
+2026-10-09T20:06:36.197Z Gastos TI escuchando en http://localhost:3000 (PDFs en C:\Users\Martinez\Desktop\TI gastos\uploads)
+2026-10-12T17:32:00.725Z ---- arranque ----
+2026-10-12T17:32:01.149Z Se limpió un postmaster.pid huérfano.
+2026-10-12T17:32:06.937Z PostgreSQL embebido listo en 127.0.0.1:5433 (datos en C:\Users\Martinez\Desktop\TI gastos\pgdata)
+2026-10-12T17:32:07.206Z Gastos TI escuchando en http://localhost:3000 (PDFs en C:\Users\Martinez\Desktop\TI gastos\uploads)
+2026-10-13T13:25:03.161Z ---- arranque ----
+2026-10-13T13:25:03.161Z ---- arranque ----
+2026-10-13T13:25:03.389Z Se limpió un postmaster.pid huérfano.
+2026-10-13T13:25:03.624Z No se pudo preparar la base de datos: error desconocido
+2026-10-13T13:25:07.834Z PostgreSQL embebido listo en 127.0.0.1:5433 (datos en C:\Users\Martinez\Desktop\TI gastos\pgdata)
+2026-10-13T13:25:08.187Z Gastos TI escuchando en http://localhost:3000 (PDFs en C:\Users\Martinez\Desktop\TI gastos\uploads)
+2026-10-13T13:47:09.398Z ---- arranque ----
+2026-10-13T13:47:09.434Z Se limpió un postmaster.pid huérfano.
+2026-10-13T13:47:11.227Z PostgreSQL embebido listo en 127.0.0.1:5433 (datos en C:\Users\Martinez\Desktop\TI gastos\pgdata)
+2026-10-13T13:47:11.436Z Gastos TI escuchando en http://localhost:3000 (PDFs en C:\Users\Martinez\Desktop\TI gastos\uploads)

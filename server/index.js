@@ -1,0 +1,530 @@
+"use strict";
+require("dotenv").config();
+const path = require("path");
+const fs = require("fs");
+const express = require("express");
+const multer = require("multer");
+const db = require("./db");
+
+const PORT = Number(process.env.PORT) || 3000;
+const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, "..", "uploads"));
+const IVA = Number(process.env.IVA || 0.16);
+const TIPOS_DOC = ["cotizacion", "orden_compra", "factura", "albaran", "pago", "pedido"];
+const TIPOS_NOMBRE = { cotizacion: "Cotización", orden_compra: "Orden de compra", factura: "Factura", albaran: "Albarán", pago: "Comprobante de pago", pedido: "Confirmación de pedido" };
+const TIPOS_COMPRA = ["proveedor", "linea"];
+const MESES = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
+
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+// Copia de la consola en servidor.log para poder diagnosticar sin la ventana abierta.
+try {
+  const logFile = path.resolve(process.env.LOG_FILE || path.join(__dirname, "..", "servidor.log"));
+  const stream = fs.createWriteStream(logFile, { flags: "a" });
+  for (const m of ["log", "error", "warn"]) {
+    const orig = console[m].bind(console);
+    console[m] = (...a) => { orig(...a); try { stream.write(new Date().toISOString() + " " + a.map(x => (x instanceof Error ? x.stack : typeof x === "string" ? x : JSON.stringify(x))).join(" ") + "\n"); } catch {} };
+  }
+  console.log("---- arranque ----");
+} catch {}
+
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+app.use(express.static(path.join(__dirname, "..", "public")));
+
+// Helper para rutas async
+const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+const money = n => new Intl.NumberFormat("es-MX", { style: "currency", currency: "MXN" }).format(Number(n) || 0);
+const round2 = n => Math.round((Number(n) || 0) * 100) / 100;
+
+async function proveedorId(nombre, rfc, client = db) {
+  nombre = (nombre || "").trim();
+  rfc = (rfc || "").trim().toUpperCase() || null;
+  if (!nombre && rfc) {
+    const porRfc = await client.query("SELECT id FROM proveedores WHERE rfc = $1", [rfc]);
+    if (porRfc.rowCount) return porRfc.rows[0].id;
+  }
+  if (!nombre) return null;
+  const r = await client.query(
+    "INSERT INTO proveedores (nombre, rfc) VALUES ($1, $2) ON CONFLICT (nombre) DO UPDATE SET rfc = COALESCE(EXCLUDED.rfc, proveedores.rfc) RETURNING id",
+    [nombre, rfc]
+  );
+  return r.rows[0].id;
+}
+const TIPOS_ARCHIVO = { ".pdf": "application/pdf", ".xml": "application/xml" };
+const esArchivoPermitido = file => /\.(pdf|xml)$/i.test(file.originalname || "") || ["application/pdf", "application/xml", "text/xml"].includes(file.mimetype);
+const extDe = nombre => (/\.xml$/i.test(nombre || "") ? ".xml" : ".pdf");
+async function evento(gastoId, tipo, descripcion, fecha) {
+  await db.query("INSERT INTO eventos (gasto_id, tipo, descripcion, fecha) VALUES ($1, $2, $3, COALESCE($4, now()))", [gastoId, tipo, descripcion, fecha || null]);
+}
+
+// ---------- Categorías ----------
+app.get("/api/categorias", wrap(async (req, res) => {
+  const r = await db.query("SELECT c.*, (SELECT count(*) FROM gastos g WHERE g.categoria_id = c.id)::int AS num_gastos FROM categorias c WHERE activa ORDER BY nombre");
+  res.json(r.rows);
+}));
+app.post("/api/categorias", wrap(async (req, res) => {
+  const nombre = (req.body.nombre || "").trim();
+  if (!nombre) return res.status(400).json({ error: "Falta el nombre de la categoría." });
+  const r = await db.query("INSERT INTO categorias (nombre) VALUES ($1) ON CONFLICT (nombre) DO UPDATE SET activa = true RETURNING *", [nombre]);
+  res.status(201).json(r.rows[0]);
+}));
+app.delete("/api/categorias/:id", wrap(async (req, res) => {
+  const used = await db.query("SELECT 1 FROM gastos WHERE categoria_id = $1 LIMIT 1", [req.params.id]);
+  if (used.rowCount) return res.status(409).json({ error: "La categoría tiene gastos registrados; reasígnalos antes de quitarla." });
+  await db.query("UPDATE categorias SET activa = false WHERE id = $1", [req.params.id]);
+  res.json({ ok: true });
+}));
+
+// ---------- Proveedores ----------
+const SQL_PROVEEDORES = `
+  SELECT p.id, p.nombre, p.rfc,
+         (SELECT count(*) FROM gastos g WHERE g.proveedor_id = p.id)::int AS num_gastos,
+         (SELECT sum(total) FROM gastos g WHERE g.proveedor_id = p.id) AS total,
+         u.categoria_id AS ultima_categoria_id, c.nombre AS ultima_categoria
+  FROM proveedores p
+  LEFT JOIN LATERAL (SELECT categoria_id FROM gastos g WHERE g.proveedor_id = p.id ORDER BY fecha DESC, id DESC LIMIT 1) u ON true
+  LEFT JOIN categorias c ON c.id = u.categoria_id`;
+app.get("/api/proveedores", wrap(async (req, res) => {
+  const r = await db.query(SQL_PROVEEDORES + " ORDER BY lower(p.nombre)");
+  res.json(r.rows.map(x => ({ ...x, total: Number(x.total) || 0 })));
+}));
+app.post("/api/proveedores", wrap(async (req, res) => {
+  const nombre = (req.body.nombre || "").trim();
+  if (!nombre) return res.status(400).json({ error: "Falta el nombre del proveedor." });
+  const id = await proveedorId(nombre, req.body.rfc);
+  const r = await db.query(SQL_PROVEEDORES + " WHERE p.id = $1", [id]);
+  res.status(201).json({ ...r.rows[0], total: Number(r.rows[0].total) || 0 });
+}));
+app.put("/api/proveedores/:id", wrap(async (req, res) => {
+  const nombre = (req.body.nombre || "").trim();
+  if (!nombre) return res.status(400).json({ error: "Falta el nombre del proveedor." });
+  const dup = await db.query("SELECT 1 FROM proveedores WHERE nombre = $1 AND id <> $2", [nombre, req.params.id]);
+  if (dup.rowCount) return res.status(409).json({ error: "Ya existe otro proveedor con ese nombre." });
+  await db.query("UPDATE proveedores SET nombre = $1, rfc = $2 WHERE id = $3", [nombre, (req.body.rfc || "").trim().toUpperCase() || null, req.params.id]);
+  const r = await db.query(SQL_PROVEEDORES + " WHERE p.id = $1", [req.params.id]);
+  if (!r.rowCount) return res.status(404).json({ error: "Proveedor no encontrado." });
+  res.json({ ...r.rows[0], total: Number(r.rows[0].total) || 0 });
+}));
+app.delete("/api/proveedores/:id", wrap(async (req, res) => {
+  const used = await db.query("SELECT 1 FROM gastos WHERE proveedor_id = $1 LIMIT 1", [req.params.id]);
+  if (used.rowCount) return res.status(409).json({ error: "El proveedor tiene gastos registrados; no se puede quitar." });
+  await db.query("DELETE FROM proveedores WHERE id = $1", [req.params.id]);
+  res.json({ ok: true });
+}));
+
+// ---------- Lectura de facturas (XML CFDI o PDF) para prellenar el formulario ----------
+const TMP_DIR = path.join(UPLOAD_DIR, "_tmp");
+fs.mkdirSync(TMP_DIR, { recursive: true });
+// Limpieza de temporales viejos (más de 1 día) al arrancar
+try { for (const f of fs.readdirSync(TMP_DIR)) { const p = path.join(TMP_DIR, f); if (Date.now() - fs.statSync(p).mtimeMs > 86400000) fs.rmSync(p, { force: true }); } } catch {}
+const uploadTmp = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, TMP_DIR),
+    filename: (req, file, cb) => cb(null, `factura-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${extDe(file.originalname)}`),
+  }),
+  limits: { fileSize: Number(process.env.MAX_PDF_MB || 25) * 1024 * 1024 },
+  fileFilter: (req, file, cb) => { const ok = esArchivoPermitido(file); cb(ok ? null : new Error("Sube la factura en PDF o el XML del CFDI."), ok); },
+});
+app.post("/api/facturas/analizar", (req, res, next) => {
+  uploadTmp.single("archivo")(req, res, err => (err ? res.status(400).json({ error: err.message }) : next()));
+}, wrap(async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "Falta el archivo." });
+  const { analizarArchivo } = require("./factura");
+  let campos;
+  try { campos = await analizarArchivo(req.file.path, req.file.originalname); }
+  catch (e) { fs.rm(req.file.path, { force: true }, () => {}); return res.status(400).json({ error: "No se pudo leer la factura: " + e.message }); }
+  // Proveedor conocido por RFC o por nombre
+  let proveedor = null;
+  if (campos.rfc) { const r = await db.query("SELECT id, nombre, rfc FROM proveedores WHERE rfc = $1", [campos.rfc]); if (r.rowCount) proveedor = r.rows[0]; }
+  if (!proveedor && campos.rfcs && campos.rfcs.length) { const r = await db.query("SELECT id, nombre, rfc FROM proveedores WHERE rfc = ANY($1)", [campos.rfcs]); if (r.rowCount) { proveedor = r.rows[0]; campos.rfc = proveedor.rfc; } }
+  if (!proveedor && campos.proveedor) { const r = await db.query("SELECT id, nombre, rfc FROM proveedores WHERE lower(nombre) = lower($1)", [campos.proveedor]); if (r.rowCount) proveedor = r.rows[0]; }
+  let categoria_id = null;
+  if (proveedor) { const r = await db.query("SELECT categoria_id FROM gastos WHERE proveedor_id = $1 ORDER BY fecha DESC, id DESC LIMIT 1", [proveedor.id]); if (r.rowCount) categoria_id = r.rows[0].categoria_id; }
+  delete campos.rfcs;
+  res.json({ campos: { ...campos, proveedor_id: proveedor ? proveedor.id : null, proveedor: proveedor ? proveedor.nombre : campos.proveedor, categoria_id }, temporal: path.basename(req.file.path), nombre_original: req.file.originalname });
+}));
+
+// ---------- Gastos ----------
+function cantidadDe(b) { const n = Number(b.cantidad); return n > 0 ? Math.round(n * 100) / 100 : 1; }
+function validarGasto(b) {
+  const errores = [];
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(b.fecha || "")) errores.push("La fecha debe tener formato AAAA-MM-DD.");
+  if (!(b.concepto || "").trim()) errores.push("Falta el concepto.");
+  if (!b.categoria_id) errores.push("Falta la categoría.");
+  const subtotal = Number(b.subtotal), total = Number(b.total);
+  if (!(subtotal >= 0) && !(total > 0)) errores.push("Captura el subtotal o el total pagado.");
+  if (b.estado && !["pendiente", "pagado"].includes(b.estado)) errores.push("Estado inválido.");
+  if (b.tipo_compra && !TIPOS_COMPRA.includes(b.tipo_compra)) errores.push("Tipo de compra inválido.");
+  return errores;
+}
+function montos(b) {
+  // Si viene el total (IVA incluido) y no el subtotal, se desglosa; si no, subtotal + IVA.
+  if ((b.subtotal === undefined || b.subtotal === null || b.subtotal === "") && Number(b.total) > 0) {
+    const total = round2(b.total);
+    const subtotal = b.con_iva === false ? total : round2(total / (1 + IVA));
+    return { subtotal, iva: round2(total - subtotal), total };
+  }
+  const subtotal = round2(b.subtotal);
+  const iva = b.con_iva === false ? 0 : (b.iva !== undefined && b.iva !== null && b.iva !== "" ? round2(b.iva) : round2(subtotal * IVA));
+  return { subtotal, iva, total: round2(subtotal + iva) };
+}
+
+app.get("/api/gastos", wrap(async (req, res) => {
+  const { anio, mes, categoria_id, estado, q, proveedor_id, tipo_compra } = req.query;
+  const where = [], params = [];
+  if (tipo_compra && TIPOS_COMPRA.includes(tipo_compra)) { params.push(tipo_compra); where.push(`tipo_compra = $${params.length}`); }
+  if (anio) { params.push(Number(anio)); where.push(`EXTRACT(YEAR FROM fecha) = $${params.length}`); }
+  if (mes) { params.push(Number(mes)); where.push(`EXTRACT(MONTH FROM fecha) = $${params.length}`); }
+  if (categoria_id) { params.push(Number(categoria_id)); where.push(`categoria_id = $${params.length}`); }
+  if (proveedor_id) { params.push(Number(proveedor_id)); where.push(`proveedor_id = $${params.length}`); }
+  if (estado) { params.push(estado); where.push(`estado = $${params.length}`); }
+  if (q) { params.push("%" + q + "%"); where.push(`(concepto ILIKE $${params.length} OR coalesce(proveedor,'') ILIKE $${params.length} OR coalesce(notas,'') ILIKE $${params.length} OR coalesce(centro_costo,'') ILIKE $${params.length} OR EXISTS (SELECT 1 FROM documentos d WHERE d.gasto_id = v_gastos.id AND d.folio ILIKE $${params.length}))`); }
+  const r = await db.query(`SELECT * FROM v_gastos ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY fecha DESC, id DESC`, params);
+  res.json(r.rows);
+}));
+
+app.get("/api/gastos/:id", wrap(async (req, res) => {
+  const g = await db.query("SELECT * FROM v_gastos WHERE id = $1", [req.params.id]);
+  if (!g.rowCount) return res.status(404).json({ error: "Gasto no encontrado." });
+  const docs = await db.query("SELECT id, tipo, folio, fecha, nombre_original, tamano, subido_en, uuid FROM documentos WHERE gasto_id = $1 ORDER BY subido_en", [req.params.id]);
+  const ev = await db.query("SELECT id, tipo, descripcion, fecha FROM eventos WHERE gasto_id = $1 ORDER BY fecha DESC, id DESC", [req.params.id]);
+  res.json({ ...g.rows[0], documentos: docs.rows, eventos: ev.rows });
+}));
+
+app.post("/api/gastos", wrap(async (req, res) => {
+  const b = req.body, errores = validarGasto(b);
+  if (errores.length) return res.status(400).json({ error: errores.join(" ") });
+  const m = montos(b);
+  const pid = b.proveedor_id ? Number(b.proveedor_id) : await proveedorId(b.proveedor, b.proveedor_rfc);
+  if (b.proveedor_id && b.proveedor_rfc) await db.query("UPDATE proveedores SET rfc = COALESCE(rfc, $1) WHERE id = $2", [String(b.proveedor_rfc).toUpperCase(), pid]);
+  const tipoCompra = TIPOS_COMPRA.includes(b.tipo_compra) ? b.tipo_compra : "proveedor";
+  const r = await db.query(
+    `INSERT INTO gastos (fecha, concepto, proveedor_id, categoria_id, subtotal, iva, total, estado, centro_costo, notas, tipo_compra, referencia, cantidad)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+    [b.fecha, b.concepto.trim(), pid, Number(b.categoria_id), m.subtotal, m.iva, m.total, b.estado || "pendiente", (b.centro_costo || "").trim() || null, (b.notas || "").trim() || null, tipoCompra, (b.referencia || "").trim() || null, cantidadDe(b)]
+  );
+  const id = r.rows[0].id;
+  const provNombre = pid ? (await db.query("SELECT nombre FROM proveedores WHERE id = $1", [pid])).rows[0]?.nombre : null;
+  await evento(id, "gasto_creado", (tipoCompra === "linea" ? "Compra en línea registrada" : "Gasto registrado") + ` por ${money(m.total)}` + (provNombre ? ` con ${provNombre}` : "") + (b.referencia ? ` (pedido ${String(b.referencia).trim()})` : ""), b.fecha + "T12:00:00");
+
+  // Documento leído desde el formulario (factura, comprobante de pago o confirmación de pedido): pasa del temporal al expediente.
+  const tipoAdj = ["pago", "pedido", "factura"].includes(b.factura_tipo) ? b.factura_tipo : "factura";
+  if (b.factura_temporal && /^factura-[\w-]+\.(pdf|xml)$/i.test(b.factura_temporal)) {
+    const src = path.join(TMP_DIR, b.factura_temporal);
+    if (fs.existsSync(src)) {
+      const dir = path.join(UPLOAD_DIR, String(id));
+      fs.mkdirSync(dir, { recursive: true });
+      const destName = `${tipoAdj}-${Date.now()}${path.extname(src).toLowerCase()}`;
+      fs.renameSync(src, path.join(dir, destName));
+      const rel = `${id}/${destName}`;
+      const folio = (b.factura_folio || "").trim() || null;
+      const fechaDoc = /^\d{4}-\d{2}-\d{2}$/.test(b.factura_fecha || "") ? b.factura_fecha : b.fecha;
+      await db.query(
+        "INSERT INTO documentos (gasto_id, tipo, folio, fecha, archivo, nombre_original, tamano, uuid) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        [id, tipoAdj, folio, fechaDoc, rel, (b.factura_nombre || destName).slice(0, 200), fs.statSync(path.join(dir, destName)).size, (b.factura_uuid || "").trim() || null]
+      );
+      await evento(id, "documento_subido", TIPOS_NOMBRE[tipoAdj] + (tipoAdj === "pago" ? " subido" : " subida") + (folio ? ` (folio ${folio})` : "") + " al registrar el gasto", fechaDoc + "T12:00:00");
+      if (tipoAdj === "pago" && (b.estado || "pendiente") !== "pagado") await db.query("UPDATE gastos SET estado='pagado' WHERE id=$1", [id]);
+    }
+  }
+  const g = await db.query("SELECT * FROM v_gastos WHERE id = $1", [id]);
+  res.status(201).json(g.rows[0]);
+}));
+
+app.put("/api/gastos/:id", wrap(async (req, res) => {
+  const b = req.body, errores = validarGasto(b);
+  if (errores.length) return res.status(400).json({ error: errores.join(" ") });
+  const prev = await db.query("SELECT * FROM gastos WHERE id = $1", [req.params.id]);
+  if (!prev.rowCount) return res.status(404).json({ error: "Gasto no encontrado." });
+  const m = montos(b);
+  const pid = b.proveedor_id ? Number(b.proveedor_id) : await proveedorId(b.proveedor, b.proveedor_rfc);
+  await db.query(
+    `UPDATE gastos SET fecha=$1, concepto=$2, proveedor_id=$3, categoria_id=$4, subtotal=$5, iva=$6, total=$7, estado=$8,
+       centro_costo=COALESCE($9, centro_costo), notas=COALESCE($10, notas), tipo_compra=COALESCE($12, tipo_compra), referencia=$13, cantidad=$14, actualizado_en=now() WHERE id=$11`,
+    [b.fecha, b.concepto.trim(), pid, Number(b.categoria_id), m.subtotal, m.iva, m.total, b.estado || "pendiente",
+     b.centro_costo === undefined ? null : ((b.centro_costo || "").trim() || null), b.notas === undefined ? null : ((b.notas || "").trim() || null), req.params.id,
+     TIPOS_COMPRA.includes(b.tipo_compra) ? b.tipo_compra : null, (b.referencia || "").trim() || null, cantidadDe(b)]
+  );
+  const cambios = [];
+  if (Number(prev.rows[0].total) !== m.total) cambios.push(`total ${money(prev.rows[0].total)} → ${money(m.total)}`);
+  if (prev.rows[0].estado !== (b.estado || "pendiente")) cambios.push(`estado ${prev.rows[0].estado} → ${b.estado || "pendiente"}`);
+  await evento(req.params.id, b.estado === "pagado" && prev.rows[0].estado !== "pagado" ? "gasto_pagado" : "gasto_editado", cambios.length ? "Gasto editado: " + cambios.join(", ") : "Gasto editado");
+  const g = await db.query("SELECT * FROM v_gastos WHERE id = $1", [req.params.id]);
+  res.json(g.rows[0]);
+}));
+
+app.post("/api/gastos/:id/pagar", wrap(async (req, res) => {
+  const r = await db.query("UPDATE gastos SET estado='pagado', actualizado_en=now() WHERE id=$1 AND estado <> 'pagado' RETURNING total", [req.params.id]);
+  if (r.rowCount) await evento(req.params.id, "gasto_pagado", `Marcado como pagado (${money(r.rows[0].total)})`);
+  const g = await db.query("SELECT * FROM v_gastos WHERE id = $1", [req.params.id]);
+  if (!g.rowCount) return res.status(404).json({ error: "Gasto no encontrado." });
+  res.json(g.rows[0]);
+}));
+
+app.delete("/api/gastos/:id", wrap(async (req, res) => {
+  const docs = await db.query("SELECT archivo FROM documentos WHERE gasto_id = $1", [req.params.id]);
+  await db.query("DELETE FROM gastos WHERE id = $1", [req.params.id]);
+  for (const d of docs.rows) fs.rm(path.join(UPLOAD_DIR, d.archivo), { force: true }, () => {});
+  fs.rm(path.join(UPLOAD_DIR, String(req.params.id)), { recursive: true, force: true }, () => {});
+  res.json({ ok: true });
+}));
+
+// ---------- Documentos del expediente (PDF) ----------
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      const dir = path.join(UPLOAD_DIR, String(Number(req.params.id)));
+      fs.mkdirSync(dir, { recursive: true });
+      cb(null, dir);
+    },
+    filename: (req, file, cb) => cb(null, `${req.body.tipo || "doc"}-${Date.now()}${extDe(file.originalname)}`),
+  }),
+  limits: { fileSize: Number(process.env.MAX_PDF_MB || 25) * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ok = esArchivoPermitido(file);
+    cb(ok ? null : new Error("Solo se aceptan archivos PDF o XML (CFDI)."), ok);
+  },
+});
+
+app.post("/api/gastos/:id/documentos", (req, res, next) => {
+  upload.single("archivo")(req, res, err => (err ? res.status(400).json({ error: err.message }) : next()));
+}, wrap(async (req, res) => {
+  const { tipo, folio, fecha } = req.body;
+  if (!TIPOS_DOC.includes(tipo)) { if (req.file) fs.rm(req.file.path, { force: true }, () => {}); return res.status(400).json({ error: "Tipo de documento inválido." }); }
+  if (!req.file) return res.status(400).json({ error: "Falta el archivo PDF." });
+  const g = await db.query("SELECT id FROM gastos WHERE id = $1", [req.params.id]);
+  if (!g.rowCount) { fs.rm(req.file.path, { force: true }, () => {}); return res.status(404).json({ error: "Gasto no encontrado." }); }
+  const rel = path.relative(UPLOAD_DIR, req.file.path).split(path.sep).join("/");
+  // Si es el XML de una factura, se toman folio, fecha y UUID del CFDI cuando no se capturaron.
+  let folioDoc = (folio || "").trim() || null, fechaDoc = /^\d{4}-\d{2}-\d{2}$/.test(fecha || "") ? fecha : null, uuid = null;
+  if (/\.xml$/i.test(req.file.originalname)) {
+    try { const { leerXml } = require("./factura"); const c = leerXml(fs.readFileSync(req.file.path, "utf8")); folioDoc = folioDoc || c.folio; fechaDoc = fechaDoc || c.fecha; uuid = c.uuid; } catch {}
+  }
+  const r = await db.query(
+    "INSERT INTO documentos (gasto_id, tipo, folio, fecha, archivo, nombre_original, tamano, uuid) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, tipo, folio, fecha, nombre_original, tamano, subido_en, uuid",
+    [req.params.id, tipo, folioDoc, fechaDoc, rel, req.file.originalname, req.file.size, uuid]
+  );
+  await evento(req.params.id, "documento_subido", `${TIPOS_NOMBRE[tipo]} ${tipo === "pago" ? "subido" : "subida"}` + (folioDoc ? ` (folio ${folioDoc})` : ""), fechaDoc ? fechaDoc + "T12:00:00" : null);
+  if (tipo === "pago") {
+    const pagado = await db.query("UPDATE gastos SET estado='pagado', actualizado_en=now() WHERE id=$1 AND estado <> 'pagado' RETURNING total", [req.params.id]);
+    if (pagado.rowCount) await evento(req.params.id, "gasto_pagado", `Marcado como pagado por el comprobante de pago (${money(pagado.rows[0].total)})`);
+  }
+  res.status(201).json(r.rows[0]);
+}));
+
+app.get("/api/documentos/:id/archivo", wrap(async (req, res) => {
+  const r = await db.query("SELECT archivo, nombre_original FROM documentos WHERE id = $1", [req.params.id]);
+  if (!r.rowCount) return res.status(404).json({ error: "Documento no encontrado." });
+  const file = path.join(UPLOAD_DIR, r.rows[0].archivo);
+  if (!file.startsWith(UPLOAD_DIR) || !fs.existsSync(file)) return res.status(404).json({ error: "El archivo ya no está en el servidor." });
+  res.setHeader("Content-Type", TIPOS_ARCHIVO[path.extname(file).toLowerCase()] || "application/octet-stream");
+  res.setHeader("Content-Disposition", `${req.query.descargar ? "attachment" : "inline"}; filename="${encodeURIComponent(r.rows[0].nombre_original || "documento.pdf")}"`);
+  fs.createReadStream(file).pipe(res);
+}));
+
+app.delete("/api/documentos/:id", wrap(async (req, res) => {
+  const r = await db.query("DELETE FROM documentos WHERE id = $1 RETURNING gasto_id, tipo, archivo, folio", [req.params.id]);
+  if (!r.rowCount) return res.status(404).json({ error: "Documento no encontrado." });
+  fs.rm(path.join(UPLOAD_DIR, r.rows[0].archivo), { force: true }, () => {});
+  await evento(r.rows[0].gasto_id, "documento_borrado", `${TIPOS_NOMBRE[r.rows[0].tipo]} eliminada` + (r.rows[0].folio ? ` (folio ${r.rows[0].folio})` : ""));
+  res.json({ ok: true });
+}));
+
+// ---------- Presupuestos ----------
+app.get("/api/presupuestos/:anio", wrap(async (req, res) => {
+  const r = await db.query(
+    "SELECT c.id AS categoria_id, c.nombre AS categoria, coalesce(p.monto, 0) AS monto FROM categorias c LEFT JOIN presupuestos p ON p.categoria_id = c.id AND p.anio = $1 WHERE c.activa ORDER BY c.nombre",
+    [Number(req.params.anio)]
+  );
+  res.json({ anio: Number(req.params.anio), categorias: r.rows, total: r.rows.reduce((a, x) => a + Number(x.monto), 0) });
+}));
+app.put("/api/presupuestos/:anio", wrap(async (req, res) => {
+  const anio = Number(req.params.anio);
+  const items = Array.isArray(req.body.categorias) ? req.body.categorias : [];
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const it of items) {
+      await client.query(
+        "INSERT INTO presupuestos (anio, categoria_id, monto) VALUES ($1,$2,$3) ON CONFLICT (anio, categoria_id) DO UPDATE SET monto = EXCLUDED.monto",
+        [anio, Number(it.categoria_id), round2(it.monto)]
+      );
+    }
+    await client.query("COMMIT");
+  } catch (e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); }
+  res.json({ ok: true });
+}));
+
+// ---------- KPIs ----------
+app.get("/api/kpis", wrap(async (req, res) => {
+  const anio = Number(req.query.anio) || new Date().getFullYear();
+  const hoy = new Date();
+  const mesesTranscurridos = anio < hoy.getFullYear() ? 12 : anio > hoy.getFullYear() ? 0 : hoy.getMonth() + 1;
+
+  const porMes = await db.query(
+    `SELECT EXTRACT(MONTH FROM fecha)::int AS mes, sum(total) AS total, count(*)::int AS n,
+            sum(total) FILTER (WHERE estado='pendiente') AS pendiente
+     FROM gastos WHERE EXTRACT(YEAR FROM fecha) = $1 GROUP BY 1 ORDER BY 1`, [anio]);
+  const porMesCat = await db.query(
+    `SELECT EXTRACT(MONTH FROM fecha)::int AS mes, c.nombre AS categoria, sum(g.total) AS total, count(*)::int AS n
+     FROM gastos g JOIN categorias c ON c.id = g.categoria_id WHERE EXTRACT(YEAR FROM fecha) = $1 GROUP BY 1,2`, [anio]);
+  const porMesProv = await db.query(
+    `SELECT EXTRACT(MONTH FROM fecha)::int AS mes, coalesce(p.nombre, 'Sin proveedor') AS proveedor, sum(g.total) AS total, count(*)::int AS n
+     FROM gastos g LEFT JOIN proveedores p ON p.id = g.proveedor_id WHERE EXTRACT(YEAR FROM fecha) = $1 GROUP BY 1,2`, [anio]);
+  const mayores = await db.query(
+    `SELECT DISTINCT ON (EXTRACT(MONTH FROM fecha)) EXTRACT(MONTH FROM fecha)::int AS mes, id, concepto, proveedor, total
+     FROM v_gastos WHERE EXTRACT(YEAR FROM fecha) = $1 ORDER BY EXTRACT(MONTH FROM fecha), total DESC`, [anio]);
+  const porCat = await db.query(
+    `SELECT c.id AS categoria_id, c.nombre AS categoria,
+            coalesce((SELECT sum(total) FROM gastos g WHERE g.categoria_id = c.id AND EXTRACT(YEAR FROM g.fecha) = $1), 0) AS total,
+            coalesce((SELECT monto FROM presupuestos p WHERE p.categoria_id = c.id AND p.anio = $1), 0) AS presupuesto,
+            (SELECT count(*) FROM gastos g WHERE g.categoria_id = c.id AND EXTRACT(YEAR FROM g.fecha) = $1)::int AS n
+     FROM categorias c WHERE c.activa ORDER BY total DESC, c.nombre`, [anio]);
+  const porProv = await db.query(
+    `SELECT coalesce(p.nombre, 'Sin proveedor') AS proveedor, sum(g.total) AS total, count(*)::int AS n
+     FROM gastos g LEFT JOIN proveedores p ON p.id = g.proveedor_id WHERE EXTRACT(YEAR FROM fecha) = $1 GROUP BY 1 ORDER BY 2 DESC LIMIT 8`, [anio]);
+  const expediente = await db.query(
+    `SELECT count(*)::int AS total,
+            count(*) FILTER (WHERE expediente_completo)::int AS completos,
+            count(*) FILTER (WHERE tipo_compra = 'proveedor' AND NOT tiene_cotizacion)::int AS sin_cotizacion,
+            count(*) FILTER (WHERE tipo_compra = 'proveedor' AND NOT tiene_orden_compra)::int AS sin_orden_compra,
+            count(*) FILTER (WHERE tipo_compra = 'linea' AND NOT tiene_pedido)::int AS sin_pedido,
+            count(*) FILTER (WHERE NOT tiene_factura)::int AS sin_factura,
+            count(*) FILTER (WHERE NOT tiene_albaran)::int AS sin_albaran,
+            count(*) FILTER (WHERE tipo_compra = 'linea')::int AS en_linea,
+            count(*) FILTER (WHERE tipo_compra = 'proveedor')::int AS por_proveedor
+     FROM v_gastos WHERE EXTRACT(YEAR FROM fecha) = $1`, [anio]);
+  const porTipo = await db.query(
+    `SELECT EXTRACT(MONTH FROM fecha)::int AS mes, tipo_compra, sum(total) AS total, count(*)::int AS n
+     FROM gastos WHERE EXTRACT(YEAR FROM fecha) = $1 GROUP BY 1, 2`, [anio]);
+
+  const presupuestoAnual = porCat.rows.reduce((a, r) => a + Number(r.presupuesto), 0);
+  const presupuestoMensual = presupuestoAnual / 12;
+  const totalAnio = porMes.rows.reduce((a, r) => a + Number(r.total), 0);
+  const mesesConGasto = porMes.rows.filter(r => Number(r.total) > 0).length;
+  const promedioMensual = mesesConGasto ? totalAnio / mesesConGasto : 0;
+
+  const meses = [];
+  for (let m = 1; m <= 12; m++) {
+    const base = porMes.rows.find(r => r.mes === m) || { total: 0, n: 0, pendiente: 0 };
+    const cats = porMesCat.rows.filter(r => r.mes === m).sort((a, b) => b.total - a.total);
+    const provs = porMesProv.rows.filter(r => r.mes === m).sort((a, b) => b.total - a.total);
+    const total = Number(base.total) || 0;
+    const prev = meses[m - 2] ? meses[m - 2].total : null;
+    meses.push({
+      mes: m, nombre: MESES[m - 1], total, n: base.n || 0, pendiente: Number(base.pendiente) || 0,
+      presupuesto: presupuestoMensual,
+      pct_presupuesto: presupuestoMensual ? total / presupuestoMensual : null,
+      variacion_pct: prev ? (total - prev) / prev : null,
+      vs_promedio_pct: promedioMensual ? (total - promedioMensual) / promedioMensual : null,
+      categorias: cats.map(c => ({ categoria: c.categoria, total: Number(c.total), n: c.n })),
+      top_categorias: cats.slice(0, 3).map(c => ({ categoria: c.categoria, total: Number(c.total), n: c.n, pct: total ? Number(c.total) / total : 0 })),
+      top_proveedores: provs.slice(0, 3).map(p => ({ proveedor: p.proveedor, total: Number(p.total), n: p.n, pct: total ? Number(p.total) / total : 0 })),
+      mayor_gasto: mayores.rows.find(r => r.mes === m) || null,
+      por_tipo: {
+        proveedor: Number((porTipo.rows.find(r => r.mes === m && r.tipo_compra === "proveedor") || {}).total) || 0,
+        linea: Number((porTipo.rows.find(r => r.mes === m && r.tipo_compra === "linea") || {}).total) || 0,
+      },
+    });
+  }
+
+  // Mes más caro y sus razones, en texto listo para mostrar
+  const conGasto = meses.filter(x => x.total > 0);
+  let mesMasCaro = null;
+  if (conGasto.length) {
+    const top = conGasto.reduce((a, b) => (b.total > a.total ? b : a));
+    const razones = [];
+    const c0 = top.top_categorias[0];
+    if (c0) razones.push(`${c0.categoria} concentró el ${Math.round(c0.pct * 100)} % del mes (${money(c0.total)} en ${c0.n} gasto${c0.n === 1 ? "" : "s"}).`);
+    if (top.mayor_gasto) razones.push(`El gasto individual más alto fue "${top.mayor_gasto.concepto}"${top.mayor_gasto.proveedor ? " con " + top.mayor_gasto.proveedor : ""}: ${money(top.mayor_gasto.total)} (${Math.round(Number(top.mayor_gasto.total) / top.total * 100)} % del mes).`);
+    const p0 = top.top_proveedores[0];
+    if (p0 && (!top.mayor_gasto || p0.n > 1)) razones.push(`${p0.proveedor} fue el proveedor con más gasto: ${money(p0.total)} en ${p0.n} factura${p0.n === 1 ? "" : "s"}.`);
+    if (promedioMensual && conGasto.length > 1) razones.push(`Quedó ${Math.round(top.vs_promedio_pct * 100)} % por encima del promedio mensual del año (${money(promedioMensual)}).`);
+    if (top.variacion_pct !== null) razones.push(`${top.variacion_pct >= 0 ? "Subió" : "Bajó"} ${Math.abs(Math.round(top.variacion_pct * 100))} % respecto a ${MESES[top.mes - 2]}.`);
+    if (presupuestoMensual) razones.push(`Representa el ${Math.round(top.pct_presupuesto * 100)} % del presupuesto mensual (${money(presupuestoMensual)}).`);
+    const prom_n = conGasto.reduce((a, x) => a + x.n, 0) / conGasto.length;
+    if (top.n > prom_n * 1.3 && conGasto.length > 1) razones.push(`Hubo más movimientos de lo normal: ${top.n} gastos contra un promedio de ${prom_n.toFixed(1)} al mes.`);
+    mesMasCaro = { mes: top.mes, nombre: top.nombre, total: top.total, razones };
+  }
+
+  res.json({
+    anio,
+    totales: {
+      anio: totalAnio, n: porMes.rows.reduce((a, r) => a + r.n, 0),
+      pendiente: porMes.rows.reduce((a, r) => a + (Number(r.pendiente) || 0), 0),
+      presupuesto_anual: presupuestoAnual, presupuesto_mensual: presupuestoMensual,
+      disponible: presupuestoAnual - totalAnio,
+      prorrateado: presupuestoAnual * mesesTranscurridos / 12, meses_transcurridos: mesesTranscurridos,
+      promedio_mensual: promedioMensual,
+      por_tipo: {
+        proveedor: porTipo.rows.filter(r => r.tipo_compra === "proveedor").reduce((a, r) => a + Number(r.total), 0),
+        linea: porTipo.rows.filter(r => r.tipo_compra === "linea").reduce((a, r) => a + Number(r.total), 0),
+      },
+    },
+    meses,
+    mes_mas_caro: mesMasCaro,
+    por_categoria: porCat.rows.map(r => ({ ...r, total: Number(r.total), presupuesto: Number(r.presupuesto), pct: Number(r.presupuesto) ? Number(r.total) / Number(r.presupuesto) : null })),
+    por_proveedor: porProv.rows.map(r => ({ ...r, total: Number(r.total) })),
+    expediente: expediente.rows[0],
+  });
+}));
+
+// ---------- Línea de tiempo ----------
+app.get("/api/timeline", wrap(async (req, res) => {
+  const anio = Number(req.query.anio) || new Date().getFullYear();
+  const mes = req.query.mes ? Number(req.query.mes) : null;
+  const params = [anio]; let extra = "";
+  if (mes) { params.push(mes); extra = " AND EXTRACT(MONTH FROM e.fecha) = $2"; }
+  const r = await db.query(
+    `SELECT e.id, e.tipo, e.descripcion, e.fecha, e.gasto_id, g.concepto, g.total, g.estado, g.categoria, g.proveedor
+     FROM eventos e LEFT JOIN v_gastos g ON g.id = e.gasto_id
+     WHERE EXTRACT(YEAR FROM e.fecha) = $1 ${extra}
+     ORDER BY e.fecha DESC, e.id DESC LIMIT 500`, params);
+  res.json(r.rows);
+}));
+
+// ---------- Exportar CSV ----------
+app.get("/api/export.csv", wrap(async (req, res) => {
+  const anio = Number(req.query.anio) || new Date().getFullYear();
+  const r = await db.query(
+    `SELECT v.*, (SELECT string_agg(coalesce(d.folio,''), ' | ') FROM documentos d WHERE d.gasto_id = v.id AND d.tipo='factura') AS folios_factura
+     FROM v_gastos v WHERE EXTRACT(YEAR FROM fecha) = $1 ORDER BY fecha, id`, [anio]);
+  const cell = v => { const s = v === null || v === undefined ? "" : String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const head = ["ID","Fecha","Tipo de compra","Concepto","Proveedor","Categoría","Subtotal","IVA","Total","Estado","Núm. pedido / referencia","Folio factura","Cotización","Orden de compra","Pedido","Factura","Albarán","Comprobante de pago","Notas"];
+  const lines = r.rows.map(g => [g.id, g.fecha, g.tipo_compra === "linea" ? "En línea" : "Por proveedor", g.concepto, g.proveedor, g.categoria, g.subtotal, g.iva, g.total, g.estado, g.referencia, g.folios_factura,
+    g.tiene_cotizacion ? "Sí" : "No", g.tiene_orden_compra ? "Sí" : "No", g.tiene_pedido ? "Sí" : "No", g.tiene_factura ? "Sí" : "No", g.tiene_albaran ? "Sí" : "No", g.tiene_pago ? "Sí" : "No", g.notas].map(cell).join(","));
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="gastos-ti-${anio}.csv"`);
+  res.send("﻿" + [head.join(",")].concat(lines).join("\r\n"));
+}));
+
+app.get("/api/salud", wrap(async (req, res) => { await db.query("SELECT 1"); res.json({ ok: true }); }));
+
+// Errores
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: err.message || "Error interno." });
+});
+
+// Arranque: PostgreSQL externo si hay DATABASE_URL (p. ej. Docker Compose); si no, PostgreSQL embebido.
+(async () => {
+  try {
+    // Un .env con la cadena de ejemplo sin personalizar no apunta a ninguna base real: se usa el embebido.
+    if (process.env.DATABASE_URL && /cambia-esta-clave@localhost:5432/.test(process.env.DATABASE_URL)) {
+      console.log("DATABASE_URL tiene el valor de ejemplo del .env; se ignora y se usa PostgreSQL embebido.");
+      delete process.env.DATABASE_URL;
+    }
+    if (!process.env.DATABASE_URL) {
+      const { startEmbedded } = require("./embedded");
+      await startEmbedded(console.log);
+    } else {
+      console.log("Usando PostgreSQL externo: " + process.env.DATABASE_URL.replace(/:\/\/([^:]+):[^@]*@/, "://$1:***@"));
+    }
+    await db.migrate();
+    app.listen(PORT, "0.0.0.0", () => console.log(`Gastos TI escuchando en http://localhost:${PORT} (PDFs en ${UPLOAD_DIR})`));
+  } catch (err) {
+    console.error("No se pudo preparar la base de datos:", (err && err.message) || String(err || "error desconocido"));
+    console.error("Revisa el archivo .env: deja DATABASE_URL vacío para usar PostgreSQL embebido, o apunta a tu servidor PostgreSQL.");
+    process.exit(1);
+  }
+})();

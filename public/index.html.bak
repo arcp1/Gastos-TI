@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gastos TI · CGR</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <div class="mark">C<span>G</span>R</div>
+      <div><h1>Gastos TI</h1><p>Control de gastos del área de TI · montos en MXN</p></div>
+    </div>
+    <div class="period">
+      <span class="status" id="status"><i></i><span>Conectando…</span></span>
+      <select id="selYear" aria-label="Año"></select>
+      <select id="selMonth" aria-label="Mes"></select>
+      <a id="btnExport" href="#"><button type="button">Exportar CSV</button></a>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button type="button" data-view="tablero" class="active">Tablero</button>
+    <button type="button" data-view="gastos">Gastos y expedientes</button>
+    <button type="button" data-view="timeline">Línea de tiempo</button>
+    <button type="button" data-view="presupuesto">Presupuesto</button>
+  </nav>
+
+  <!-- ============ TABLERO ============ -->
+  <section class="view" id="view-tablero">
+    <div class="kpis" id="kpis"></div>
+
+    <div class="two">
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>¿Qué mes ha costado más y por qué?</h2><p>Haz clic en un mes para ver su desglose</p></div>
+        </div>
+        <div class="reason" id="reason"></div>
+        <div class="months" id="months"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><div><h2 id="detailTitle">Desglose del mes</h2><p>Categorías, proveedores y el gasto más alto</p></div></div>
+        <div class="detail" id="detail"></div>
+      </section>
+    </div>
+
+    <div class="two">
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>Gasto mensual</h2><p>Contra el presupuesto mensual (anual ÷ 12)</p></div>
+          <div class="legend"><span>Meses</span><span class="l-cur">Mes seleccionado</span><span class="l-bud">Presupuesto mensual</span></div>
+        </div>
+        <svg class="chart" id="chart" viewBox="0 0 640 240" role="img" aria-label="Gasto por mes"></svg>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><div><h2>Por categoría</h2><p>Acumulado del año contra presupuesto anual</p></div></div>
+        <div class="tbl-wrap"><table id="catTable"><thead><tr><th>Categoría</th><th class="r">Gastos</th><th class="r">Año</th><th class="r">% presup.</th></tr></thead><tbody></tbody></table></div>
+      </section>
+    </div>
+
+    <div class="two even">
+      <section class="panel">
+        <div class="panel-head"><div><h2>Proveedores con más gasto</h2><p>Acumulado del año</p></div></div>
+        <div class="tbl-wrap"><table id="provTable"><thead><tr><th>Proveedor</th><th class="r">Facturas</th><th class="r">Total</th></tr></thead><tbody></tbody></table></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><div><h2>Estado de los expedientes</h2><p>Gastos del año a los que les falta algún documento</p></div></div>
+        <div class="detail" id="expediente"></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ============ GASTOS ============ -->
+  <section class="view" id="view-gastos" hidden>
+    <section class="panel capture" id="capturePanel">
+      <div class="seg" role="group" aria-label="Tipo de compra">
+        <button type="button" class="seg-btn active" data-tipo="proveedor">Compra por proveedor</button>
+        <button type="button" class="seg-btn" data-tipo="linea">Compra en línea</button>
+      </div>
+      <form class="capture-form" id="form" autocomplete="off">
+        <label class="big">¿Qué compraste?<input type="text" id="fConcepto" placeholder="Ej. 12 líneas Telcel de octubre" required></label>
+        <div class="amount-row">
+          <label class="big amount">¿Cuánto costó?<span class="money-wrap"><span class="cur">$</span><input type="number" id="fMonto" min="0" step="0.01" placeholder="0.00" inputmode="decimal" required></span></label>
+          <label class="chip chip-select" title="Cómo viene el monto"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 19L19 5"></path><circle cx="7.5" cy="7.5" r="2.5"></circle><circle cx="16.5" cy="16.5" r="2.5"></circle></svg><select id="fIvaModo" aria-label="IVA"><option value="incluido">IVA incluido</option><option value="mas">Más IVA 16 %</option><option value="sin">Sin IVA</option></select></label>
+        </div>
+        <div class="chips">
+          <label class="chip" title="Fecha"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M3 10h18M8 3v4M16 3v4"></path></svg><input type="date" id="fFecha" aria-label="Fecha"></label>
+          <label class="chip chip-select" title="Proveedor o tienda"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 9l1.5-5h15L21 9"></path><path d="M3 9v11h18V9"></path><path d="M9 20v-6h6v6"></path></svg><select id="fProveedor" aria-label="Proveedor o tienda"></select></label>
+          <label class="chip chip-input" id="chipProveedorNuevo" hidden><input type="text" id="fProveedorNuevo" placeholder="Nombre del proveedor" aria-label="Nuevo proveedor"><datalist id="tiendasList"></datalist></label>
+          <label class="chip chip-select" title="Categoría"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12l-8 8-9-9V3h8z"></path><circle cx="7.5" cy="7.5" r="1.5"></circle></svg><select id="fCategoria" aria-label="Categoría"></select></label>
+          <label class="chip chip-input" id="chipReferencia" hidden><input type="text" id="fReferencia" placeholder="Núm. de pedido" aria-label="Número de pedido"></label>
+          <label class="chip chip-toggle" title="Estado de pago"><input type="checkbox" id="fPagado"><span>Pagado</span></label>
+        </div>
+        <div class="capture-actions">
+          <button type="submit" class="primary big-btn" id="btnSave">Guardar compra</button>
+          <button type="button" id="btnCancel" hidden>Cancelar</button>
+          <span class="totalbox">Subtotal <b id="tSub">$0.00</b> · IVA <b id="tIva">$0.00</b> · Total <b id="tTotal">$0.00</b></span>
+        </div>
+        <div class="capture-foot">
+          <label class="linkish"><input type="file" id="fFactura" accept=".pdf,.xml,application/pdf,application/xml,text/xml"><span id="facturaBtnText">¿Tienes la factura o el comprobante? Súbelo y se llena solo</span></label>
+          <span class="msg" id="formMsg"></span>
+          <span class="note" id="facturaHint"></span>
+        </div>
+        <div class="factura-chip" id="facturaChip" hidden>
+          <span id="facturaChipText"></span>
+          <button type="button" class="ghost small" id="btnQuitarFactura">Quitar</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel" id="drawerPanel" hidden>
+      <div class="drawer" id="drawer"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div><h2>Registro de gastos</h2><p id="regSub"></p></div>
+        <div class="filters">
+          <select id="filScope"><option value="month">Mes seleccionado</option><option value="year">Todo el año</option></select>
+          <select id="filTipo"><option value="">Proveedor y en línea</option><option value="proveedor">Por proveedor</option><option value="linea">En línea</option></select>
+          <select id="filCat"><option value="">Todas las categorías</option></select>
+          <select id="filEstado"><option value="">Pagados y pendientes</option><option value="pendiente">Solo pendientes</option><option value="pagado">Solo pagados</option></select>
+          <input type="search" id="filQ" placeholder="Buscar proveedor, concepto, folio">
+        </div>
+      </div>
+      <div class="tbl-wrap">
+        <table id="regTable">
+          <thead><tr><th>Fecha</th><th>Concepto</th><th>Proveedor / tienda</th><th>Categoría</th><th class="r">Total</th><th>Estado</th><th>Expediente</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="note">Expediente: los cuadros son las etapas de cada tipo de compra (por proveedor: cotización, orden de compra, factura, albarán; en línea: pedido, factura, entrega). Verde = documento cargado. El símbolo $ indica que tiene comprobante de pago.</p>
+    </section>
+  </section>
+
+  <!-- ============ LÍNEA DE TIEMPO ============ -->
+  <section class="view" id="view-timeline" hidden>
+    <section class="panel">
+      <div class="panel-head">
+        <div><h2>Línea de tiempo</h2><p>Todo lo que pasó con los gastos del año: altas, documentos del expediente, pagos y cambios</p></div>
+        <div class="filters"><select id="tlScope"><option value="year">Todo el año</option><option value="month">Mes seleccionado</option></select></div>
+      </div>
+      <div class="timeline" id="timeline"></div>
+    </section>
+  </section>
+
+  <!-- ============ PRESUPUESTO ============ -->
+  <section class="view" id="view-presupuesto" hidden>
+    <section class="panel">
+      <div class="panel-head"><div><h2>Presupuesto anual por categoría</h2><p>Para el año <b id="budgetYear"></b>. El presupuesto mensual del tablero es el anual entre 12.</p></div></div>
+      <div class="budget-grid" id="budgetGrid"></div>
+      <div class="addcat"><input type="text" id="newCat" placeholder="Nueva categoría (p. ej. Capacitación)"><button type="button" id="btnAddCat">Agregar categoría</button></div>
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+        <button type="button" class="primary" id="btnSaveBudget">Guardar presupuesto</button>
+        <span class="msg" id="budgetMsg"></span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><div><h2>Proveedores</h2><p>Aparecen en la lista del formulario. Se crean solos al registrar un gasto o leer una factura; aquí puedes agregarlos, corregirlos o quitar los que no tengan gastos.</p></div></div>
+      <form class="prov-form" id="provForm" autocomplete="off">
+        <input type="hidden" id="provId">
+        <input type="text" id="provNombre" placeholder="Nombre del proveedor" required>
+        <input type="text" id="provRfc" placeholder="RFC (opcional)" maxlength="13">
+        <button type="submit" id="btnProvSave">Agregar proveedor</button>
+        <button type="button" id="btnProvCancel" hidden>Cancelar</button>
+        <span class="msg" id="provMsg"></span>
+      </form>
+      <div class="tbl-wrap">
+        <table id="provAdminTable">
+          <thead><tr><th>Proveedor</th><th>RFC</th><th>Categoría habitual</th><th class="r">Gastos</th><th class="r">Total</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </section>
+</div>
+<div class="toast" id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

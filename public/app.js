@@ -1,0 +1,565 @@
+(() => {
+  "use strict";
+  const MESES = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
+  const MESES_C = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
+  const IVA = 0.16;
+  const TIPOS = [["cotizacion","Cotización"],["orden_compra","Orden de compra"],["factura","Factura"],["albaran","Albarán"]];
+  const TIPO_PAGO = ["pago", "Comprobante de pago"];
+  const fmt = new Intl.NumberFormat("es-MX", { style: "currency", currency: "MXN" });
+  const money = n => fmt.format(Number(n) || 0);
+  const pct = n => (n === null || n === undefined || !isFinite(n) ? "—" : Math.round(n * 100) + " %");
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+  const fmtDate = iso => { if (!iso) return "—"; const [y, m, d] = String(iso).slice(0, 10).split("-"); return `${d}/${m}/${y}`; };
+  const fmtDateTime = iso => { const d = new Date(iso); return isNaN(d) ? "—" : d.toLocaleDateString("es-MX", { day: "2-digit", month: "short" }) + " " + d.toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit", hour12: false }); };
+  const todayISO = () => { const d = new Date(); return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"); };
+  const now = new Date();
+
+  const state = {
+    year: now.getFullYear(), month: now.getMonth() + 1, view: "inicio",
+    categorias: [], proveedores: [], kpis: null, gastos: [], presupuesto: null, timeline: [],
+    editing: null, drawerId: null, modoCaptura: "elegir", selMonth: null, factura: null, ivaExacto: null, tipoCompra: null,
+    filters: { scope: "month", cat: "", estado: "", q: "", tipo: "" }, tlScope: "year",
+  };
+
+  // ---------- API ----------
+  async function api(path, opts = {}) {
+    const o = Object.assign({ headers: {} }, opts);
+    if (o.body && !(o.body instanceof FormData)) { o.headers["Content-Type"] = "application/json"; o.body = JSON.stringify(o.body); }
+    const r = await fetch(path, o);
+    let data = null; try { data = await r.json(); } catch {}
+    if (!r.ok) throw new Error((data && data.error) || ("Error " + r.status));
+    return data;
+  }
+  function toast(text, err) { const t = $("toast"); t.textContent = text; t.className = "toast show" + (err ? " err" : ""); clearTimeout(toast.t); toast.t = setTimeout(() => t.className = "toast", 3200); }
+  function setStatus(ok, text) { const el = $("status"); el.className = "status" + (ok ? "" : " err"); el.querySelector("span").textContent = text; el.title = text; }
+  function levelClass(r) { return r >= 1 ? "bad" : r >= 0.85 ? "warn" : ""; }
+
+  // ---------- Loading ----------
+  async function loadBase() {
+    [state.categorias, state.proveedores] = await Promise.all([api("/api/categorias"), api("/api/proveedores")]);
+    renderCatSelects(); renderProveedores();
+  }
+  async function loadDashboard() {
+    state.kpis = await api("/api/kpis?anio=" + state.year);
+    if (!state.kpis.meses.some(m => Array.isArray(m.categorias))) {
+      // Servidor sin reiniciar: se arma el desglose mes × categoría a partir de los gastos del año
+      try {
+        const gs = await api("/api/gastos?anio=" + state.year);
+        state.kpis.meses.forEach(m => { m.categorias = []; });
+        gs.forEach(g => {
+          const m = state.kpis.meses[new Date(g.fecha).getMonth()]; if (!m) return;
+          let c = m.categorias.find(x => x.categoria === g.categoria);
+          if (!c) { c = { categoria: g.categoria, total: 0, n: 0 }; m.categorias.push(c); }
+          c.total += Number(g.total); c.n++;
+        });
+      } catch (e) { /* sin desglose: barras lisas */ }
+    }
+    renderDashboard();
+  }
+  async function loadGastos() {
+    const f = state.filters;
+    const p = new URLSearchParams({ anio: state.year });
+    if (f.scope === "month") p.set("mes", state.month);
+    if (f.cat) p.set("categoria_id", f.cat);
+    if (f.estado) p.set("estado", f.estado);
+    if (f.tipo) p.set("tipo_compra", f.tipo);
+    if (f.q.trim()) p.set("q", f.q.trim());
+    state.gastos = await api("/api/gastos?" + p);
+    renderRegister();
+  }
+  async function loadTimeline() {
+    const p = new URLSearchParams({ anio: state.year });
+    if (state.tlScope === "month") p.set("mes", state.month);
+    state.timeline = await api("/api/timeline?" + p);
+    renderTimeline();
+  }
+  async function loadBudget() { state.presupuesto = await api("/api/presupuestos/" + state.year); renderBudget(); }
+  async function refreshAll() {
+    try {
+      await loadBase();
+      await Promise.all([loadDashboard(), loadGastos(), loadTimeline(), loadBudget()]);
+      if (state.drawerId) await openDrawer(state.drawerId, true);
+      setStatus(true, "Conectado a PostgreSQL");
+    } catch (e) { setStatus(false, "Sin conexión al servidor"); toast(e.message, true); }
+  }
+
+  // ---------- Period & tabs ----------
+  function renderPeriod() {
+    const sy = $("selYear"), sm = $("selMonth");
+    const ys = []; for (let y = now.getFullYear() - 3; y <= now.getFullYear() + 1; y++) ys.push(y);
+    if (!ys.includes(state.year)) ys.push(state.year);
+    sy.innerHTML = ys.sort().map(y => `<option value="${y}">${y}</option>`).join(""); sy.value = state.year;
+    sm.innerHTML = MESES.map((m, i) => `<option value="${i + 1}">${m}</option>`).join(""); sm.value = state.month;
+    $("budgetYear").textContent = state.year;
+    $("btnExport").href = "/api/export.csv?anio=" + state.year;
+  }
+  $("selYear").addEventListener("change", e => { state.year = Number(e.target.value); state.selMonth = null; renderPeriod(); refreshAll(); });
+  $("selMonth").addEventListener("change", e => { state.month = Number(e.target.value); state.selMonth = null; renderDashboard(); loadGastos(); if (state.tlScope === "month") loadTimeline(); });
+  // Tooltips de los iconos de información (se dibujan fuera de los paneles para que no se recorten)
+  (function () {
+    const tip = $("tip"); let cur = null;
+    function show(el) {
+      cur = el; tip.textContent = el.dataset.tip; tip.hidden = false;
+      const r = el.getBoundingClientRect(), w = Math.min(300, innerWidth - 24);
+      tip.style.width = w + "px";
+      let left = r.right - w; if (left < 12) left = 12;
+      let top = r.bottom + 8; if (top + tip.offsetHeight > innerHeight - 8) top = r.top - tip.offsetHeight - 8;
+      tip.style.left = left + "px"; tip.style.top = top + "px";
+    }
+    function hide() { cur = null; tip.hidden = true; }
+    document.addEventListener("mouseover", e => { const b = e.target.closest(".info"); if (b && b !== cur) show(b); else if (!b && cur && cur.classList.contains("info") && !e.target.closest("#tip")) hide(); });
+    document.addEventListener("focusin", e => { const b = e.target.closest(".info"); if (b) show(b); else if (cur && cur.classList.contains("info")) hide(); });
+    document.addEventListener("click", e => { const b = e.target.closest(".info, .kpi[data-tip]"); if (b) { b === cur && !tip.hidden ? hide() : show(b); } else if (!e.target.closest("#tip")) hide(); });
+    document.addEventListener("keydown", e => { if ((e.key === "Enter" || e.key === " ") && e.target.matches(".kpi[data-tip]")) { e.preventDefault(); e.target === cur && !tip.hidden ? hide() : show(e.target); } });
+    document.addEventListener("keydown", e => { if (e.key === "Escape") hide(); });
+    window.addEventListener("scroll", hide, true); window.addEventListener("resize", hide);
+  })();
+  function showView(name) {
+    state.view = name;
+    $("tabs").querySelectorAll("button").forEach(x => x.classList.toggle("active", x.dataset.view === name));
+    document.querySelectorAll(".view").forEach(v => v.hidden = v.id !== "view-" + name);
+    document.body.classList.toggle("en-inicio", name === "inicio");
+    document.body.classList.toggle("v-tablero", name === "tablero");
+    window.scrollTo({ top: 0 });
+  }
+  $("tabs").addEventListener("click", e => { const b = e.target.closest("button[data-view]"); if (b) showView(b.dataset.view); });
+  $("view-inicio").addEventListener("click", e => { const b = e.target.closest("button[data-view]"); if (b) showView(b.dataset.view); });
+  document.querySelector(".brand").addEventListener("click", () => showView("inicio"));
+  document.body.classList.add("en-inicio");
+
+  // ---------- Dashboard ----------
+  function renderDashboard() {
+    const k = state.kpis; if (!k) return;
+    const t = k.totales, m = k.meses[state.month - 1];
+    const TIPS = {
+      mes: "Suma de todos los gastos registrados en el mes seleccionado (IVA incluido). Si hay presupuesto, la barra muestra qué porcentaje del presupuesto mensual llevas.",
+      anio: "Suma de todos los gastos del año. Si hay presupuesto, la barra muestra qué porcentaje del presupuesto anual llevas consumido.",
+      presupuesto: "Presupuesto anual total: la suma de lo capturado por categoría en la pestaña Presupuesto.",
+      prorrateo: "Compara lo gastado en el año contra lo que 'deberías' llevar a la fecha si el presupuesto se repartiera parejo entre los 12 meses. Positivo = vas por debajo del ritmo esperado; negativo = vas por encima.",
+      pendiente: "Total de las facturas del año que todavía están marcadas como pendientes de pago.",
+    };
+    const kpi = (label, value, sub, extra = "", hi = false, tip = "") => `<div class="kpi${hi ? " hi" : ""}"${tip ? ` tabindex="0" role="button" aria-label="${esc(label)}: ver descripción" data-tip="${esc(tip)}"` : ""}><span class="eyebrow">${label}</span><span class="v">${value}</span>${extra}</div>`;
+    const meter = r => `<div class="meter"><b class="${levelClass(r)}" style="width:${Math.min(100, r * 100)}%"></b></div>`;
+    $("kpis").innerHTML =
+      kpi("Gastado en " + MESES[state.month - 1], money(m.total), t.presupuesto_mensual ? pct(m.pct_presupuesto) + " del presupuesto mensual (" + money(t.presupuesto_mensual) + ")" : m.n + " gasto" + (m.n === 1 ? "" : "s"), t.presupuesto_mensual ? meter(m.pct_presupuesto) : "", true, TIPS.mes) +
+      kpi("Acumulado " + k.anio, money(t.anio), t.presupuesto_anual ? pct(t.anio / t.presupuesto_anual) + " del presupuesto anual" : t.n + " gastos en el año", t.presupuesto_anual ? meter(t.anio / t.presupuesto_anual) : "", false, TIPS.anio) +
+      kpi("Presupuesto anual", money(t.presupuesto_anual), t.presupuesto_anual ? "Disponible: " + money(t.disponible) : "Captúralo en la pestaña Presupuesto", "", false, TIPS.presupuesto) +
+      kpi("Contra prorrateo", t.presupuesto_anual ? money(t.prorrateado - t.anio) : "—", t.presupuesto_anual ? (t.prorrateado - t.anio >= 0 ? "Por debajo" : "Por encima") + " de lo esperado a " + t.meses_transcurridos + " mes" + (t.meses_transcurridos === 1 ? "" : "es") : "Sin presupuesto", "", false, TIPS.prorrateo) +
+      kpi("Pendiente de pago", money(t.pendiente), "Facturas del año sin pagar", "", false, TIPS.pendiente);
+
+    // Mes más caro
+    const r = k.mes_mas_caro;
+    $("reason").innerHTML = r
+      ? `<div class="big">${r.nombre} <span class="num">${money(r.total)}</span></div><ul>${r.razones.map(x => `<li>${esc(x)}</li>`).join("")}</ul>`
+      : `<div class="big">Sin gastos en ${k.anio}</div><p class="note">Registra gastos para ver qué mes pesa más y por qué.</p>`;
+    const sel = state.selMonth || (r ? r.mes : state.month);
+    state.chartSel = sel;
+    renderDetail(sel);
+    renderChart();
+
+    // Categorías
+    const rows = k.por_categoria.filter(c => c.total || c.presupuesto);
+    $("catLegend").innerHTML = rows.length ? rows.map(c => `<div class="cl-row">
+        <i style="background:${catColor(c.categoria)}"></i><span class="cl-name">${esc(c.categoria)}</span>
+        <span class="num cl-total">${money(c.total)}</span>
+        <span class="cl-pct">${c.presupuesto ? `<span class="catbar"><b class="${levelClass(c.pct || 0)}" style="width:${Math.min(100, (c.pct || 0) * 100)}%"></b></span><span class="num">${pct(c.pct)}</span>` : `<span class="muted">sin presupuesto</span>`}</span>
+      </div>`).join("") + `<div class="cl-row total"><i></i><span class="cl-name">Total ${k.anio}</span><span class="num cl-total">${money(t.anio)}</span><span class="cl-pct">${t.presupuesto_anual ? `<span class="num">${pct(t.anio / t.presupuesto_anual)} del presupuesto</span>` : ""}</span></div>` + `<div class="cl-row"><i class="cl-bud"></i><span class="cl-name muted">Línea punteada: presupuesto mensual</span></div>`
+      : `<p class="empty">Sin gastos ni presupuesto en ${k.anio}.</p>`;
+    $("provTable").querySelector("tbody").innerHTML = k.por_proveedor.length ? k.por_proveedor.map(p => `<tr><td>${esc(p.proveedor)}</td><td class="num r">${p.n}</td><td class="num r">${money(p.total)}</td></tr>`).join("") : `<tr><td colspan="3" class="empty">Sin gastos en ${k.anio}.</td></tr>`;
+
+  }
+  $("chart").addEventListener("click", e => { const b = e.target.closest("[data-mes]"); if (!b) return; state.selMonth = Number(b.dataset.mes); renderDashboard(); });
+
+  function renderDetail(mes) {
+    const m = state.kpis.meses[mes - 1];
+    $("detailTitle").textContent = "Desglose de " + m.nombre;
+    if (!m.total) { $("detail").innerHTML = `<p class="empty">Sin gastos en ${m.nombre}.</p>`; return; }
+    const pair = (a, b) => `<div class="pair"><span>${a}</span><b class="num">${b}</b></div>`;
+    $("detail").innerHTML =
+      pair("Total del mes", money(m.total)) + pair("Gastos registrados", m.n) + pair("Pendiente de pago", money(m.pendiente)) +
+      (m.por_tipo ? pair("Compras por proveedor", money(m.por_tipo.proveedor)) + pair("Compras en línea", money(m.por_tipo.linea)) : "") +
+      (m.variacion_pct !== null ? pair("Contra " + MESES[mes - 2], (m.variacion_pct >= 0 ? "+" : "") + pct(m.variacion_pct)) : "") +
+      (m.vs_promedio_pct !== null ? pair("Contra el promedio mensual", (m.vs_promedio_pct >= 0 ? "+" : "") + pct(m.vs_promedio_pct)) : "") +
+      (m.presupuesto ? pair("Del presupuesto mensual", pct(m.pct_presupuesto)) : "") +
+      `<h3 style="margin-top:6px">Categorías</h3>` + m.top_categorias.map(c => pair(esc(c.categoria) + ` <span class="muted">(${c.n})</span>`, money(c.total) + ` <span class="muted">${pct(c.pct)}</span>`)).join("") +
+      `<h3 style="margin-top:6px">Proveedores</h3>` + m.top_proveedores.map(p => pair(esc(p.proveedor) + ` <span class="muted">(${p.n})</span>`, money(p.total) + ` <span class="muted">${pct(p.pct)}</span>`)).join("") +
+      (m.mayor_gasto ? `<h3 style="margin-top:6px">Gasto más alto</h3><div class="pair"><span><a href="#" data-open="${m.mayor_gasto.id}">${esc(m.mayor_gasto.concepto)}</a>${m.mayor_gasto.proveedor ? ` <span class="muted">· ${esc(m.mayor_gasto.proveedor)}</span>` : ""}</span><b class="num">${money(m.mayor_gasto.total)}</b></div>` : "");
+  }
+  document.addEventListener("click", e => { const a = e.target.closest("a[data-open]"); if (!a) return; e.preventDefault(); showView("gastos"); openDrawer(Number(a.dataset.open)); });
+
+  const CAT_COLORS = ["#1b3d79", "#b31671", "#148ec2", "#a4ae2d", "#d67c2f", "#869199", "#6c5fc7", "#2a9d8f", "#e0a800", "#8e5a3c"];
+  function catColor(nombre) {
+    const order = (state.kpis && state.kpis.por_categoria || []).map(c => c.categoria);
+    let i = order.indexOf(nombre); if (i < 0) i = order.length;
+    return CAT_COLORS[i % CAT_COLORS.length];
+  }
+  function renderChart() {
+    const k = state.kpis, svg = $("chart");
+    const W = 640, H = 250, padL = 64, padR = 12, padT = 14, padB = 30;
+    const totals = k.meses.map(m => m.total), budMes = k.totales.presupuesto_mensual;
+    const rawMax = Math.max(...totals, budMes || 0);
+    const maxV = (rawMax > 0 ? rawMax : 100000) * 1.12; // sin datos: escala de referencia hasta $100k
+    const innerW = W - padL - padR, innerH = H - padT - padB;
+    const x = i => padL + (i + 0.15) * (innerW / 12), bw = (innerW / 12) * 0.7, y = v => padT + innerH - (v / maxV) * innerH;
+    const niceStep = raw => { const p = Math.pow(10, Math.floor(Math.log10(raw))); const f = raw / p; return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * p; };
+    const short = v => v >= 1e6 ? "$" + (v / 1e6).toFixed(v % 1e6 ? 1 : 0) + "M" : v >= 1e3 ? "$" + (v / 1e3).toFixed(v % 1e3 ? 1 : 0) + "k" : "$" + Math.round(v);
+    const step = niceStep(maxV / 4); let out = "";
+    for (let v = 0; v <= maxV; v += step) out += `<line class="grid" x1="${padL}" x2="${W - padR}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}"/><text x="${padL - 6}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end">${short(v)}</text>`;
+    totals.forEach((v, i) => {
+      const future = state.year > now.getFullYear() || (state.year === now.getFullYear() && i > now.getMonth());
+      const selM = state.chartSel || state.month, isSel = i + 1 === selM;
+      const cats = (k.meses[i].categorias || []).filter(c => c.total > 0).slice().sort((a, b) => b.total - a.total);
+      let bars = "";
+      if (v > 0 && cats.length) {
+        let acc = 0;
+        cats.forEach(c => {
+          const y1 = y(acc + c.total), y0 = y(acc); acc += c.total;
+          bars += `<rect class="seg" x="${x(i).toFixed(1)}" y="${y1.toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0.5, y0 - y1).toFixed(1)}" fill="${catColor(c.categoria)}"><title>${esc(c.categoria)}: ${money(c.total)}</title></rect>`;
+        });
+      } else {
+        const h = v > 0 ? Math.max(1.5, y(0) - y(v)) : (future ? 2 : 0);
+        bars = `<rect class="${v > 0 ? "bar" : "bar future"}" x="${x(i).toFixed(1)}" y="${(y(0) - h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="2"/>`;
+      }
+      out += `<g class="col${isSel ? " sel" : ""}" data-mes="${i + 1}"><rect class="hit" x="${(x(i) - bw * 0.2).toFixed(1)}" y="${padT}" width="${(bw * 1.4).toFixed(1)}" height="${innerH}" rx="6"/>${bars}${isSel ? `<rect class="selbox" x="${(x(i) - 3).toFixed(1)}" y="${(y(v) - 3).toFixed(1)}" width="${(bw + 6).toFixed(1)}" height="${(y(0) - y(v) + 6).toFixed(1)}" rx="4"/>` : ""}<text x="${(x(i) + bw / 2).toFixed(1)}" y="${H - 10}" text-anchor="middle">${MESES_C[i]}</text><title>${MESES[i]}: ${money(v)}</title></g>`;
+    });
+    if (budMes > 0) out += `<line class="budget" x1="${padL}" x2="${W - padR}" y1="${y(budMes).toFixed(1)}" y2="${y(budMes).toFixed(1)}"/>`;
+    svg.innerHTML = out;
+  }
+
+  // ---------- Register ----------
+  function renderCatSelects() {
+    const opts = state.categorias.map(c => `<option value="${c.id}">${esc(c.nombre)}</option>`).join("");
+    const keep = (sel, html) => { const v = sel.value; sel.innerHTML = html; sel.value = v; if (sel.selectedIndex < 0) sel.selectedIndex = 0; };
+    keep($("fCategoria"), opts);
+    if (!state.editing && !state.catTocada && typeof categoriaPorDefecto === "function") categoriaPorDefecto();
+    keep($("filCat"), `<option value="">Todas las categorías</option>` + opts);
+    const linea = state.tipoCompra === "linea", t = TEXTOS[state.tipoCompra || "proveedor"];
+    keep($("fProveedor"), `<option value="">${t.prov}</option>` + state.proveedores.map(p => `<option value="${p.id}">${esc(p.nombre)}</option>`).join("") + `<option value="__nuevo__">${t.nuevo}</option>`);
+    if ($("fProveedor").value !== "__nuevo__") mostrarProveedorNuevo(false);
+    $("tiendasList").innerHTML = linea ? TIENDAS_SUGERIDAS.filter(x => !state.proveedores.some(p => p.nombre.toLowerCase() === x.toLowerCase())).map(x => `<option value="${esc(x)}">`).join("") : "";
+    $("fProveedorNuevo").setAttribute("list", linea ? "tiendasList" : ""); $("fProveedorNuevo").placeholder = t.nuevoPh;
+  }
+  function mostrarProveedorNuevo(on) {
+    $("chipProveedorNuevo").hidden = !on;
+    if (!on) $("fProveedorNuevo").value = "";
+  }
+  $("fProveedor").addEventListener("change", () => {
+    const v = $("fProveedor").value;
+    mostrarProveedorNuevo(v === "__nuevo__");
+    if (v === "__nuevo__") { $("fProveedorNuevo").focus(); return; }
+    const p = state.proveedores.find(x => String(x.id) === v);
+    if (p && p.ultima_categoria_id) $("fCategoria").value = p.ultima_categoria_id;
+  });
+  const ETAPAS = { proveedor: [["tiene_cotizacion","Cotización"],["tiene_orden_compra","Orden de compra"],["tiene_factura","Factura"],["tiene_albaran","Albarán"]], linea: [["tiene_pedido","Pedido"],["tiene_factura","Factura"],["tiene_albaran","Entrega"]] };
+  const steps = g => { const et = ETAPAS[g.tipo_compra === "linea" ? "linea" : "proveedor"]; return `<span class="steps" title="${et.map(([k, n]) => n + " " + (g[k] ? "✓" : "–")).join(" · ")}">${et.map(([k]) => `<i class="${g[k] ? "on" : ""}"></i>`).join("")}</span>`; };
+  function renderRegister() {
+    const rows = state.gastos, tb = $("regTable").querySelector("tbody");
+    $("regSub").textContent = rows.length + " registro" + (rows.length === 1 ? "" : "s") + " · " + money(rows.reduce((a, g) => a + Number(g.total), 0));
+    if (!rows.length) { tb.innerHTML = `<tr><td colspan="8" class="empty">No hay gastos con estos filtros. Registra uno con el formulario de arriba.</td></tr>`; return; }
+    tb.innerHTML = rows.map(g => `<tr data-id="${g.id}" class="${g.id === state.drawerId ? "sel" : ""}">
+      <td class="num">${fmtDate(g.fecha)}</td>
+      <td class="concept"><a href="#" data-open="${g.id}">${esc(g.concepto)}</a>${Number(g.cantidad) > 1 ? ` <span class="pill qty">× ${Number(g.cantidad)}</span>` : ""}${g.notas ? `<br><span class="note">${esc(g.notas)}</span>` : ""}</td>
+      <td>${esc(g.proveedor || "—")}${g.tipo_compra === "linea" ? ' <span class="pill linea">en línea</span>' : ""}${g.referencia ? `<div class="note">Pedido ${esc(g.referencia)}</div>` : ""}</td><td>${esc(g.categoria)}</td>
+      <td class="num r">${money(g.total)}</td>
+      <td><span class="pill ${g.estado}">${g.estado === "pagado" ? "Pagado" : "Pendiente"}</span></td>
+      <td>${steps(g)} <span class="muted">${g.etapas != null ? g.etapas : g.num_documentos}/${g.etapas_total || 4}${g.tiene_pago ? ' <span class="pill pagado" title="Tiene comprobante de pago">$</span>' : ""}</span></td>
+      <td><span class="row-actions">
+        <button type="button" class="ghost small" data-act="open">Expediente</button>
+        ${g.estado !== "pagado" ? `<button type="button" class="ghost small" data-act="pay">Pagar</button>` : ""}
+        <button type="button" class="ghost small" data-act="edit">Editar</button>
+        <button type="button" class="ghost small" data-act="del">Borrar</button></span></td></tr>`).join("");
+  }
+  $("regTable").addEventListener("click", async e => {
+    const btn = e.target.closest("button[data-act]"); if (!btn) return;
+    const id = Number(btn.closest("tr").dataset.id), g = state.gastos.find(x => x.id === id); if (!g) return;
+    const act = btn.dataset.act;
+    try {
+      if (act === "open") openDrawer(id);
+      else if (act === "edit") loadForm(g);
+      else if (act === "pay") { await api(`/api/gastos/${id}/pagar`, { method: "POST" }); toast("Marcado como pagado."); await Promise.all([loadGastos(), loadDashboard(), loadTimeline()]); }
+      else if (act === "del") btn.parentElement.innerHTML = `<span class="confirm">¿Borrar el gasto y sus PDF? <button type="button" class="danger small" data-act="del-yes">Sí</button><button type="button" class="ghost small" data-act="del-no">No</button></span>`;
+      else if (act === "del-no") renderRegister();
+      else if (act === "del-yes") { await api(`/api/gastos/${id}`, { method: "DELETE" }); if (state.drawerId === id) closeDrawer(); if (state.editing === id) resetForm(); toast("Gasto borrado."); await Promise.all([loadGastos(), loadDashboard(), loadTimeline(), loadBase()]); }
+    } catch (err) { toast(err.message, true); renderRegister(); }
+  });
+  ["filScope", "filCat", "filEstado", "filTipo"].forEach(id => $(id).addEventListener("change", e => { state.filters[{ filScope: "scope", filCat: "cat", filEstado: "estado", filTipo: "tipo" }[id]] = e.target.value; loadGastos(); }));
+  let qT; $("filQ").addEventListener("input", e => { state.filters.q = e.target.value; clearTimeout(qT); qT = setTimeout(loadGastos, 250); });
+
+  // ---------- Captura rápida ----------
+  const TIENDAS_SUGERIDAS = ["Amazon", "Mercado Libre", "Walmart", "Liverpool", "Office Depot", "Apple", "Microsoft", "Cyberpuerta", "PCEL"];
+  const TEXTOS = {
+    proveedor: { placeholder: "Ej. 12 líneas Telcel de octubre", prov: "Sin proveedor", nuevo: "+ Nuevo proveedor…", nuevoPh: "Nombre del proveedor", btn: "¿Tienes la factura o el comprobante de pago? Súbelo y se llena solo", guardar: "Guardar compra" },
+    linea:     { placeholder: "Ej. Disco SSD 1 TB para laptop", prov: "Sin tienda", nuevo: "+ Nueva tienda…", nuevoPh: "Nombre de la tienda", btn: "¿Tienes la factura o la confirmación del pedido? Súbela y se llena solo", guardar: "Guardar compra" },
+  };
+  function esLinea() { return state.tipoCompra === "linea"; }
+  function setTipoCompra(tipo, conservar) {
+    state.tipoCompra = tipo;
+    document.querySelectorAll(".seg-btn").forEach(b => b.classList.toggle("active", b.dataset.tipo === tipo));
+    const t = TEXTOS[tipo];
+    $("fConcepto").placeholder = t.placeholder; $("facturaBtnText").textContent = t.btn;
+    $("chipReferencia").hidden = tipo !== "linea";
+    if (!state.editing) $("btnSave").textContent = t.guardar;
+    renderCatSelects();
+    if (!conservar) {
+      $("fPagado").checked = tipo === "linea";
+      $("fIvaModo").value = "incluido";
+      categoriaPorDefecto();
+    }
+    formTotals();
+  }
+  function categoriaPorDefecto() {
+    const prov = state.proveedores.find(x => String(x.id) === $("fProveedor").value);
+    let id = prov && prov.ultima_categoria_id;
+    if (!id) { const c = state.categorias.find(c => esLinea() ? /hardware/i.test(c.nombre) : /otros/i.test(c.nombre)); id = c && c.id; }
+    if (id) $("fCategoria").value = id;
+  }
+  document.querySelector(".seg").addEventListener("click", e => { const b = e.target.closest(".seg-btn"); if (!b) return; if (state.editing) resetForm(); modoCaptura("form"); setTipoCompra(b.dataset.tipo); $("fConcepto").focus(); });
+  // Elección inicial del tipo de compra (botones grandes al centro); después se muestra el formulario
+  // Modos del contenedor de Gastos: "elegir" (dos botones), "form" (captura) y "registro" (tabla de gastos)
+  function modoCaptura(modo) {
+    const p = $("capturePanel");
+    p.classList.toggle("elegir", modo === "elegir");
+    p.classList.toggle("registro", modo === "registro");
+    state.modoCaptura = modo;
+  }
+  function mostrarFormulario(tipo) { modoCaptura("form"); if (tipo) setTipoCompra(tipo); $("fConcepto").focus(); }
+  $("chooser").addEventListener("click", e => { const b = e.target.closest(".choice"); if (!b) return; if (state.editing) resetForm(); mostrarFormulario(b.dataset.tipo); });
+  $("btnVerRegistro").addEventListener("click", () => {
+    if (state.modoCaptura === "registro") mostrarFormulario(state.tipoCompra || "proveedor");
+    else { modoCaptura("registro"); $("capturePanel").scrollIntoView({ behavior: "smooth", block: "start" }); }
+  });
+  $("btnCambiarTipo").addEventListener("click", () => { resetForm(); modoCaptura("elegir"); });
+
+  // Montos: lo normal es capturar el total con IVA incluido; también se puede capturar sin IVA o pedir que se agregue.
+  function cantidadForm() { const n = Number($("fCantidad").value); return n > 0 ? n : 1; }
+  function montosForm() {
+    const q = cantidadForm(), monto = Math.round((Number($("fMonto").value) || 0) * q * 100) / 100, modo = $("fIvaModo").value;
+    if (modo === "incluido") { const sub = Math.round(monto / (1 + IVA) * 100) / 100; return { subtotal: sub, iva: Math.round((monto - sub) * 100) / 100, total: monto }; }
+    if (modo === "mas") { const iva = state.ivaExacto != null && q === 1 ? state.ivaExacto : Math.round(monto * IVA * 100) / 100; return { subtotal: monto, iva, total: Math.round((monto + iva) * 100) / 100 }; }
+    return { subtotal: monto, iva: 0, total: monto };
+  }
+  function formTotals() {
+    const m = montosForm(), q = cantidadForm();
+    $("lblMonto").textContent = q > 1 ? "¿Cuánto costó cada uno?" : "¿Cuánto costó?";
+    $("tSub").textContent = money(m.subtotal); $("tIva").textContent = money(m.iva); $("tTotal").textContent = (q > 1 ? q + " × " : "") + money(m.total);
+  }
+  $("fCantidad").addEventListener("input", formTotals);
+  function limpiarFactura() {
+    state.factura = null; state.ivaExacto = null;
+    $("fFactura").value = ""; $("facturaChip").hidden = true; $("facturaChipText").textContent = ""; $("facturaHint").textContent = "";
+  }
+  function resetForm() {
+    state.editing = null; state.catTocada = false; $("form").reset(); $("fFecha").value = todayISO();
+    mostrarProveedorNuevo(false); limpiarFactura();
+    $("btnCancel").hidden = true; $("formMsg").textContent = "";
+    if (state.tipoCompra) setTipoCompra(state.tipoCompra);
+  }
+  function loadForm(g) {
+    resetForm(); setTipoCompra(g.tipo_compra === "linea" ? "linea" : "proveedor", true);
+    modoCaptura("form");
+    state.editing = g.id;
+    $("fFecha").value = g.fecha; $("fCategoria").value = g.categoria_id;
+    $("fProveedor").value = g.proveedor_id ? String(g.proveedor_id) : ""; mostrarProveedorNuevo(false);
+    $("fConcepto").value = g.concepto; $("fReferencia").value = g.referencia || ""; $("fPagado").checked = g.estado === "pagado";
+    const q = Number(g.cantidad) > 0 ? Number(g.cantidad) : 1; $("fCantidad").value = q;
+    const unit = v => Math.round(Number(v) / q * 100) / 100;
+    if (Number(g.iva) > 0) { $("fIvaModo").value = "incluido"; $("fMonto").value = unit(g.total); } else { $("fIvaModo").value = "sin"; $("fMonto").value = unit(g.subtotal); }
+    $("btnSave").textContent = "Guardar cambios"; $("btnCancel").hidden = false; formTotals();
+    $("capturePanel").scrollIntoView({ behavior: "smooth", block: "start" }); $("fConcepto").focus();
+  }
+  // Lectura de la factura / comprobante (XML CFDI o PDF) para prellenar
+  $("fFactura").addEventListener("change", async () => {
+    const f = $("fFactura").files[0]; if (!f) return;
+    const fd = new FormData(); fd.append("archivo", f);
+    $("facturaHint").textContent = "Leyendo el documento…";
+    try {
+      const r = await api("/api/facturas/analizar", { method: "POST", body: fd });
+      const c = r.campos;
+      const esPago = c.tipo_documento === "pago";
+      const esFacturaReal = c.origen === "xml" || !!c.uuid;
+      const tipoDoc = esPago ? "pago" : (esLinea() && !esFacturaReal ? "pedido" : "factura");
+      state.factura = { temporal: r.temporal, nombre: r.nombre_original, folio: c.folio, fecha: c.fecha, uuid: c.uuid, tipo: tipoDoc };
+      if (c.fecha) $("fFecha").value = c.fecha;
+      if (c.proveedor_id) { $("fProveedor").value = String(c.proveedor_id); mostrarProveedorNuevo(false); }
+      else if (c.proveedor) { $("fProveedor").value = "__nuevo__"; mostrarProveedorNuevo(true); $("fProveedorNuevo").value = c.proveedor; }
+      if (c.categoria_id) $("fCategoria").value = c.categoria_id;
+      if (c.concepto && !$("fConcepto").value) $("fConcepto").value = c.concepto;
+      $("fCantidad").value = 1;
+      if (c.total != null) { $("fMonto").value = c.total; $("fIvaModo").value = c.iva > 0 ? "incluido" : "sin"; }
+      else if (c.subtotal != null) { $("fMonto").value = c.subtotal; $("fIvaModo").value = c.iva > 0 ? "mas" : "sin"; state.ivaExacto = c.iva || null; }
+      if (esLinea() && tipoDoc === "pedido" && c.folio && !$("fReferencia").value) $("fReferencia").value = c.folio;
+      if (esPago) $("fPagado").checked = true;
+      formTotals();
+      const faltan = [];
+      if (!$("fConcepto").value) faltan.push("qué compraste"); if (!$("fMonto").value) faltan.push("cuánto costó");
+      const resumen = c.origen === "xml" ? "Datos tomados del XML del CFDI."
+        : esPago ? "Comprobante de pago leído: proveedor, monto, fecha y referencia. La compra quedará como pagada."
+        : tipoDoc === "pedido" ? "Se leyó lo que se pudo; se guardará como confirmación del pedido."
+        : "Datos leídos del PDF de la factura; revisa el monto.";
+      $("facturaHint").textContent = resumen + (faltan.length ? " Falta: " + faltan.join(" y ") + "." : "");
+      const etiqueta = { pago: "comprobante de pago", pedido: "confirmación del pedido", factura: "factura" }[tipoDoc];
+      $("facturaChipText").textContent = "Se guardará como " + etiqueta + " en el expediente: " + r.nombre_original + (c.folio ? " · " + (esPago ? "clave " : "folio ") + c.folio : "") + (c.referencia_factura ? " · factura " + c.referencia_factura : "");
+      $("facturaChip").hidden = false;
+      if (faltan.length) $(faltan[0] === "qué compraste" ? "fConcepto" : "fMonto").focus();
+    } catch (err) { limpiarFactura(); $("facturaHint").textContent = err.message; }
+  });
+  $("btnQuitarFactura").addEventListener("click", () => { limpiarFactura(); formTotals(); });
+  $("form").addEventListener("submit", async e => {
+    e.preventDefault();
+    const m = montosForm(), provSel = $("fProveedor").value, modo = $("fIvaModo").value;
+    if (!$("fConcepto").value.trim()) { $("formMsg").textContent = "Escribe qué compraste."; $("formMsg").className = "msg err"; $("fConcepto").focus(); return; }
+    if (!(Number($("fMonto").value) > 0)) { $("formMsg").textContent = "Escribe cuánto costó."; $("formMsg").className = "msg err"; $("fMonto").focus(); return; }
+    const body = {
+      tipo_compra: state.tipoCompra, fecha: $("fFecha").value || todayISO(), categoria_id: Number($("fCategoria").value), concepto: $("fConcepto").value,
+      estado: $("fPagado").checked ? "pagado" : "pendiente", referencia: esLinea() ? $("fReferencia").value : "",
+      cantidad: cantidadForm(),
+    };
+    if (modo === "incluido") { body.total = m.total; body.con_iva = true; }
+    else { body.subtotal = m.subtotal; body.con_iva = modo === "mas"; if (modo === "mas" && state.ivaExacto != null) body.iva = state.ivaExacto; }
+    if (provSel === "__nuevo__") { body.proveedor = $("fProveedorNuevo").value.trim(); if (!body.proveedor) { $("formMsg").textContent = esLinea() ? "Escribe el nombre de la tienda." : "Escribe el nombre del proveedor."; $("formMsg").className = "msg err"; $("fProveedorNuevo").focus(); return; } }
+    else if (provSel) body.proveedor_id = Number(provSel);
+    if (state.factura && !state.editing) Object.assign(body, { factura_temporal: state.factura.temporal, factura_nombre: state.factura.nombre, factura_folio: state.factura.folio, factura_fecha: state.factura.fecha, factura_uuid: state.factura.uuid, factura_tipo: state.factura.tipo });
+    if (!body.categoria_id) { categoriaPorDefecto(); body.categoria_id = Number($("fCategoria").value); }
+    if (!body.categoria_id) { $("formMsg").textContent = "Elige una categoría."; $("formMsg").className = "msg err"; $("fCategoria").focus(); return; }
+    $("btnSave").disabled = true;
+    try {
+      const g = state.editing ? await api(`/api/gastos/${state.editing}`, { method: "PUT", body }) : await api("/api/gastos", { method: "POST", body });
+      const wasNew = !state.editing;
+      state.year = Number(g.fecha.slice(0, 4)); state.month = Number(g.fecha.slice(5, 7)); renderPeriod();
+      const tipoAdj = wasNew && state.factura ? state.factura.tipo : null;
+      resetForm();
+      toast(!wasNew ? "Cambios guardados." : "Compra guardada: " + money(g.total) + (tipoAdj ? " · documento en el expediente" : "") + ". Los documentos se suben en su expediente cuando los tengas.");
+      await refreshAll();
+      if (wasNew && tipoAdj) openDrawer(g.id);
+      $("fConcepto").focus();
+    } catch (err) { $("formMsg").textContent = err.message; $("formMsg").className = "msg err"; }
+    finally { $("btnSave").disabled = false; }
+  });
+  ["fMonto", "fIvaModo"].forEach(id => $(id).addEventListener("input", formTotals));
+  $("fCategoria").addEventListener("change", () => { state.catTocada = true; });
+  $("fMonto").addEventListener("input", () => { state.ivaExacto = null; });
+  $("btnCancel").addEventListener("click", () => { resetForm(); });
+
+  // ---------- Drawer: expediente ----------
+  async function openDrawer(id, silent) {
+    try {
+      const g = await api("/api/gastos/" + id);
+      state.drawerId = id; renderDrawer(g); renderRegister();
+      if (!silent) $("drawerPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (err) { if (!silent) toast(err.message, true); state.drawerId = null; $("drawerPanel").hidden = true; }
+  }
+  function closeDrawer() { state.drawerId = null; $("drawerPanel").hidden = true; renderRegister(); }
+  function renderDrawer(g) {
+    $("drawerPanel").hidden = false;
+    const docsBy = t => g.documentos.filter(d => d.tipo === t);
+    const kb = n => n > 1e6 ? (n / 1e6).toFixed(1) + " MB" : Math.round(n / 1024) + " KB";
+    const etapasTipo = g.tipo_compra === "linea" ? [["pedido","Confirmación de pedido"],["factura","Factura"],["albaran","Entrega (albarán o guía)"]] : TIPOS;
+    const stages = [...etapasTipo, TIPO_PAGO].map(([t, nombre], i) => {
+      const docs = docsBy(t);
+      const esPago = t === "pago";
+      return `<div class="stage ${docs.length ? "done" : ""} ${esPago ? "opcional" : ""}">
+        <div class="st-head"><b>${nombre}${esPago ? ' <span class="muted" style="font-weight:400">· opcional</span>' : ""}</b><span class="badge">${docs.length ? "✓" : (esPago ? "$" : i + 1)}</span></div>
+        ${docs.map(d => `<div class="doc"><div class="doc-row"><a href="/api/documentos/${d.id}/archivo" target="_blank" rel="noopener">${esc(d.nombre_original || "PDF")}</a><button type="button" class="ghost small" data-deldoc="${d.id}" title="Eliminar PDF">×</button></div><span class="muted">${d.folio ? (esPago ? "Clave " : "Folio ") + esc(d.folio) + " · " : ""}${d.fecha ? fmtDate(d.fecha) + " · " : ""}${kb(d.tamano || 0)}</span></div>`).join("")}
+        <form class="upload" data-tipo="${t}">
+          <input type="text" name="folio" placeholder="${esPago ? "Clave de rastreo (opcional)" : "Folio (opcional)"}">
+          <input type="date" name="fecha" title="Fecha del documento">
+          <input type="file" name="archivo" accept="${t === "factura" ? ".pdf,.xml,application/pdf,application/xml,text/xml" : ".pdf,application/pdf"}" required>
+          <button type="submit" class="small">${docs.length ? "Subir otro archivo" : (t === "factura" ? "Subir PDF o XML" : "Subir PDF")}</button>
+        </form></div>`;
+    }).join("");
+    const done = etapasTipo.filter(([t]) => docsBy(t).length).length;
+    $("drawer").innerHTML = `
+      <div class="drawer-head">
+        <div><span class="eyebrow">Expediente · ${g.tipo_compra === "linea" ? "compra en línea" : "compra por proveedor"} #${g.id} · ${done}/${etapasTipo.length} etapas</span><h2>${esc(g.concepto)}</h2>
+          <p class="note">${fmtDate(g.fecha)} · ${esc(g.categoria)}${g.proveedor ? " · " + esc(g.proveedor) : ""}${g.referencia ? " · pedido " + esc(g.referencia) : ""}${g.centro_costo ? " · " + esc(g.centro_costo) : ""} · <span class="pill ${g.estado}">${g.estado === "pagado" ? "Pagado" : "Pendiente"}</span></p></div>
+        <div style="display:flex; gap:8px; align-items:center"><span class="amount">${money(g.total)}</span><button type="button" class="ghost" id="btnCloseDrawer">Cerrar</button></div>
+      </div>
+      <div class="flow" style="grid-template-columns: repeat(${etapasTipo.length + 1}, 1fr)">${stages}</div>
+      <details><summary>Historial de este gasto (${g.eventos.length})</summary>
+        <div class="timeline" style="margin-top:8px">${g.eventos.map(ev => `<div class="tl-item ${ev.tipo}"><span class="when">${fmtDateTime(ev.fecha)}</span><span class="what">${esc(ev.descripcion)}</span><span></span></div>`).join("") || "<p class='note'>Sin eventos.</p>"}</div>
+      </details>`;
+    $("btnCloseDrawer").addEventListener("click", closeDrawer);
+    $("drawer").querySelectorAll("form.upload").forEach(f => f.addEventListener("submit", async e => {
+      e.preventDefault();
+      const fd = new FormData();
+      fd.append("tipo", f.dataset.tipo);                 // antes del archivo: multer lo necesita para nombrarlo
+      fd.append("folio", f.folio.value); fd.append("fecha", f.fecha.value);
+      fd.append("archivo", f.archivo.files[0]);
+      const btn = f.querySelector("button"); btn.disabled = true; btn.textContent = "Subiendo…";
+      try { await api(`/api/gastos/${g.id}/documentos`, { method: "POST", body: fd }); toast("PDF guardado en el expediente."); await Promise.all([openDrawer(g.id, true), loadGastos(), loadDashboard(), loadTimeline()]); }
+      catch (err) { toast(err.message, true); btn.disabled = false; btn.textContent = "Subir PDF"; }
+    }));
+    $("drawer").querySelectorAll("button[data-deldoc]").forEach(b => b.addEventListener("click", async () => {
+      if (b.dataset.armed !== "1") { b.dataset.armed = "1"; b.textContent = "¿Eliminar?"; b.classList.add("danger"); setTimeout(() => { b.dataset.armed = ""; b.textContent = "×"; b.classList.remove("danger"); }, 3000); return; }
+      try { await api(`/api/documentos/${b.dataset.deldoc}`, { method: "DELETE" }); toast("PDF eliminado."); await Promise.all([openDrawer(g.id, true), loadGastos(), loadDashboard(), loadTimeline()]); }
+      catch (err) { toast(err.message, true); }
+    }));
+  }
+
+  // ---------- Timeline ----------
+  $("tlScope").addEventListener("change", e => { state.tlScope = e.target.value; loadTimeline(); });
+  function renderTimeline() {
+    const el = $("timeline"), ev = state.timeline;
+    if (!ev.length) { el.innerHTML = `<p class="empty">Sin movimientos en este periodo.</p>`; return; }
+    const byMonth = new Map();
+    ev.forEach(x => { const d = new Date(x.fecha); const k = d.getFullYear() + "-" + d.getMonth(); if (!byMonth.has(k)) byMonth.set(k, { d, items: [] }); byMonth.get(k).items.push(x); });
+    const totalMes = m => state.kpis ? state.kpis.meses[m].total : 0;
+    el.innerHTML = Array.from(byMonth.values()).map(({ d, items }) => `<div class="tl-month">${MESES[d.getMonth()]} ${d.getFullYear()}<span class="num">${money(totalMes(d.getMonth()))}</span></div>` +
+      items.map(x => `<div class="tl-item ${x.tipo}"><span class="when">${fmtDateTime(x.fecha)}</span><span class="what">${x.gasto_id ? `<a href="#" data-open="${x.gasto_id}">${esc(x.concepto || "Gasto #" + x.gasto_id)}</a>` : ""}<small>${esc(x.descripcion)}${x.proveedor ? " · " + esc(x.proveedor) : ""}${x.categoria ? " · " + esc(x.categoria) : ""}</small></span><span class="amt">${x.total !== null && x.total !== undefined ? money(x.total) : ""}</span></div>`).join("")).join("");
+  }
+
+  // ---------- Budget ----------
+  function renderBudget() {
+    const p = state.presupuesto; if (!p) return;
+    $("budgetGrid").innerHTML = `<span class="hd">Categoría</span><span class="hd" style="text-align:right">Anual (MXN)</span><span></span>` +
+      p.categorias.map(c => `<span>${esc(c.categoria)}</span><input type="number" min="0" step="1" data-cat="${c.categoria_id}" value="${c.monto || ""}" placeholder="0"><button type="button" class="ghost small" data-rmcat="${c.categoria_id}">Quitar</button>`).join("") +
+      `<span class="hd">Total</span><span class="num hd" style="text-align:right" id="budgetTotalCell">${money(p.total)}</span><span></span>`;
+  }
+  $("budgetGrid").addEventListener("input", () => { let t = 0; $("budgetGrid").querySelectorAll("input[data-cat]").forEach(i => t += Number(i.value) || 0); $("budgetTotalCell").textContent = money(t); });
+  $("budgetGrid").addEventListener("click", async e => {
+    const b = e.target.closest("button[data-rmcat]"); if (!b) return;
+    try { await api("/api/categorias/" + b.dataset.rmcat, { method: "DELETE" }); toast("Categoría quitada."); await Promise.all([loadBase(), loadBudget(), loadDashboard()]); }
+    catch (err) { toast(err.message, true); }
+  });
+  $("btnAddCat").addEventListener("click", async () => {
+    const nombre = $("newCat").value.trim(); if (!nombre) return;
+    try { await api("/api/categorias", { method: "POST", body: { nombre } }); $("newCat").value = ""; toast("Categoría agregada."); await Promise.all([loadBase(), loadBudget()]); }
+    catch (err) { toast(err.message, true); }
+  });
+  $("btnSaveBudget").addEventListener("click", async () => {
+    const categorias = Array.from($("budgetGrid").querySelectorAll("input[data-cat]")).map(i => ({ categoria_id: Number(i.dataset.cat), monto: Number(i.value) || 0 }));
+    $("btnSaveBudget").disabled = true;
+    try { await api("/api/presupuestos/" + state.year, { method: "PUT", body: { categorias } }); toast("Presupuesto " + state.year + " guardado."); await Promise.all([loadBudget(), loadDashboard()]); }
+    catch (err) { toast(err.message, true); } finally { $("btnSaveBudget").disabled = false; }
+  });
+
+  // ---------- Proveedores ----------
+  function renderProveedores() {
+    const tb = $("provAdminTable").querySelector("tbody");
+    if (!state.proveedores.length) { tb.innerHTML = `<tr><td colspan="6" class="empty">Aún no hay proveedores. Agrega uno aquí o registra un gasto.</td></tr>`; return; }
+    tb.innerHTML = state.proveedores.map(p => `<tr data-id="${p.id}">
+      <td>${esc(p.nombre)}</td><td class="num">${esc(p.rfc || "—")}</td><td>${esc(p.ultima_categoria || "—")}</td>
+      <td class="num r">${p.num_gastos}</td><td class="num r">${money(p.total)}</td>
+      <td><span class="row-actions"><button type="button" class="ghost small" data-pact="edit">Editar</button>${p.num_gastos ? "" : `<button type="button" class="ghost small" data-pact="del">Quitar</button>`}</span></td></tr>`).join("");
+  }
+  function resetProvForm() { $("provId").value = ""; $("provNombre").value = ""; $("provRfc").value = ""; $("btnProvSave").textContent = "Agregar proveedor"; $("btnProvCancel").hidden = true; }
+  $("provForm").addEventListener("submit", async e => {
+    e.preventDefault();
+    const id = $("provId").value, body = { nombre: $("provNombre").value.trim(), rfc: $("provRfc").value.trim() };
+    try {
+      if (id) await api("/api/proveedores/" + id, { method: "PUT", body }); else await api("/api/proveedores", { method: "POST", body });
+      toast(id ? "Proveedor actualizado." : "Proveedor agregado."); resetProvForm(); await loadBase();
+    } catch (err) { $("provMsg").textContent = err.message; $("provMsg").className = "msg err"; setTimeout(() => $("provMsg").textContent = "", 4000); }
+  });
+  $("btnProvCancel").addEventListener("click", resetProvForm);
+  $("provAdminTable").addEventListener("click", async e => {
+    const b = e.target.closest("button[data-pact]"); if (!b) return;
+    const id = Number(b.closest("tr").dataset.id), p = state.proveedores.find(x => x.id === id); if (!p) return;
+    if (b.dataset.pact === "edit") { $("provId").value = p.id; $("provNombre").value = p.nombre; $("provRfc").value = p.rfc || ""; $("btnProvSave").textContent = "Guardar cambios"; $("btnProvCancel").hidden = false; $("provNombre").focus(); }
+    else if (b.dataset.pact === "del") { try { await api("/api/proveedores/" + id, { method: "DELETE" }); toast("Proveedor quitado."); await loadBase(); } catch (err) { toast(err.message, true); } }
+  });
+
+  // ---------- Boot ----------
+  renderPeriod(); state.tipoCompra = "proveedor"; resetForm(); refreshAll();
+})();
